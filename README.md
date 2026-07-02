@@ -40,7 +40,7 @@ This is.. a directory that turns any agent into your firstmate, and you the capt
 ## Features
 
 - **One liaison** - you talk only to the first mate; it dispatches, supervises, escalates only real decisions, and reports plain outcomes.
-- **A visible crew** - every crewmate works in its own tmux window or experimental herdr tab you can watch or type into; the first mate reconciles.
+- **A visible crew** - every crewmate works in its own tmux window, experimental herdr tab, or Codex Desktop thread you can watch or type into; the first mate reconciles.
 - **Disposable worktrees** - each task runs in a clean [treehouse](https://github.com/kunchenguid/treehouse) git worktree, so parallel work on one repo never collides.
 - **Two task shapes** - ship tasks deliver a change; scout tasks investigate, plan, reproduce, or audit and leave a report.
 - **Explicit project modes** - each project ships via `no-mistakes`, `direct-PR`, or `local-only`, with an optional `+yolo` autonomy flag.
@@ -83,6 +83,9 @@ Then just talk:
 With the default tmux backend, run it inside tmux for the best experience: launching your harness from inside tmux puts every crewmate window in your own session, where you can watch the crew work in real time or type into any window to intervene.
 Outside tmux, default-backend crewmates land in a detached `firstmate` session you can attach to.
 When firstmate is running natively inside herdr and no backend override is set, it auto-detects herdr, prints an opt-out notice, and spawns into the experimental herdr backend.
+When running inside Codex Desktop on Windows, set `FM_BACKEND=codex-app` or put `codex-app` in local `config/backend`.
+That backend prepares FirstMate state, then the host app creates or forks visible Codex Desktop threads under the matching saved project.
+It is not `codex app-server` headless mode.
 With experimental herdr, attach to the selected `HERDR_SESSION` to watch the shared `firstmate` workspace and its task tabs.
 
 ## How It Works
@@ -117,7 +120,8 @@ Crewmate dispatch can stay on a static `config/crew-harness` or use optional nat
 When that profile file exists, crewmate and scout spawns must pass the resolved harness explicitly so `config/crew-harness` is not used as an unnoticed bypass.
 Secondmate launch can use a separate local `config/secondmate-harness`, whose first non-empty, non-comment line is parsed as `<harness> [<model>] [<effort>]` to durably pin that secondmate's launch profile.
 The runtime session-provider backend is selected from explicit `--backend`, `FM_BACKEND`, local `config/backend`, runtime auto-detection from `$TMUX` or `HERDR_ENV=1`, then the hard `tmux` default.
-`tmux` is the verified reference backend, and `herdr` is experimental.
+`tmux` is the verified reference backend, `herdr` is experimental, and `codex-app` is the Codex Desktop visible-thread backend.
+For `codex-app`, run `fm-spawn` first, create or fork the visible project thread with Codex Desktop app tools, then record the returned thread id with `bin/fm-codex-app record-thread`.
 Secondmate homes inherit the primary's declared local config, including `config/crew-dispatch.json`, `config/crew-harness`, and `config/backlog-backend`, at launch, bootstrap, or an explicit `bin/fm-config-push.sh` run, so their own crewmates, dispatch profiles, and backlog backend use the primary settings.
 When a routed request goes to a secondmate, firstmate marks it so the answer returns through status or a document pointer; direct typing into that secondmate window stays conversational.
 A presence-gated sub-supervisor (`/afk`) can self-handle routine events and batch only what matters while you step away.

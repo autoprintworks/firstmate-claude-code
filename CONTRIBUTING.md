@@ -46,6 +46,8 @@ See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/star
   `shellcheck bin/*.sh bin/backends/*.sh tests/*.sh` must pass, and CI enforces it.
 - Changes to harness adapters (detection in `bin/fm-harness.sh`, launch and hook mechanics in `bin/fm-spawn.sh`, busy signatures in `bin/fm-watch.sh` and `bin/fm-tmux-lib.sh`, cleanup in `bin/fm-teardown.sh`, and facts in `.agents/skills/harness-adapters/SKILL.md`) must be verified empirically against the real harness, never written from documentation alone.
 - Changes to runtime session backends (`bin/fm-backend.sh`, `bin/backends/`, and the scripts that dispatch through them) need empirical adapter notes in the relevant docs, following `docs/herdr-backend.md` for non-tmux backends.
+- Changes to `FM_BACKEND=codex-app` must prove the visible Codex Desktop thread protocol: FirstMate state is prepared first, the host app creates or forks the project-scoped thread, the returned thread id is recorded, and the thread is archived before teardown.
+  A completed app-server turn is not enough because `codex app-server` is headless and does not prove the visible project-thread workflow.
 - In Markdown, put each full sentence on its own line.
 
 ## Development

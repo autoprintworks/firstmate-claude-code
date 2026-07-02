@@ -34,6 +34,7 @@ FM_BACKEND_DEFAULT_ROOT="$(cd "$FM_BACKEND_LIB_DIR/.." && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_BACKEND_DEFAULT_ROOT}}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+FM_BACKEND_STATE_DIR="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 # Verified backend adapters. Extend only after a backend gets its own
 # bin/backends/<name>.sh and empirical verification, mirroring AGENTS.md
@@ -41,7 +42,7 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # data/fm-backend-design-d7/herdr-addendum.md) - verified against the real
 # v0.7.1/protocol-14 binary (data/fm-backend-design-d7/herdr-verification-p2.md)
 # but newer than tmux's long-proven default path.
-FM_BACKEND_KNOWN="tmux herdr"
+FM_BACKEND_KNOWN="tmux herdr codex-app"
 
 # fm_backend_is_known: 0 iff <name> has a verified adapter.
 fm_backend_is_known() {  # <name>
@@ -137,15 +138,49 @@ fm_backend_of_meta() {  # <meta-file>
 }
 
 fm_backend_meta_for_window() {  # <target> <state-dir>
-  local target=$1 state=$2 meta window
+  local target=$1 state=$2 meta window thread_id
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || continue
     window=$(fm_meta_get "$meta" window)
-    [ "$window" = "$target" ] || continue
+    thread_id=$(fm_meta_get "$meta" thread_id)
+    [ "$window" = "$target" ] || [ "$thread_id" = "$target" ] || continue
     printf '%s' "$meta"
     return 0
   done
   return 1
+}
+
+fm_backend_codex_app_helper() {
+  printf '%s/bin/fm-codex-app' "$FM_ROOT"
+}
+
+fm_backend_codex_app_meta_for_target() {  # <target>
+  local target=$1 meta id window thread_id
+  case "$target" in
+    fm-*)
+      meta="$FM_BACKEND_STATE_DIR/${target#fm-}.meta"
+      [ -f "$meta" ] && { printf '%s' "$meta"; return 0; }
+      ;;
+  esac
+  for meta in "$FM_BACKEND_STATE_DIR"/*.meta; do
+    [ -e "$meta" ] || continue
+    id=$(basename "$meta" .meta)
+    window=$(fm_meta_get "$meta" window)
+    thread_id=$(fm_meta_get "$meta" thread_id)
+    [ "$target" = "$window" ] || [ "$target" = "$thread_id" ] || [ "$target" = "fm-$id" ] || continue
+    printf '%s' "$meta"
+    return 0
+  done
+  return 1
+}
+
+fm_backend_codex_app_thread_id() {  # <target>
+  local meta thread_id
+  meta=$(fm_backend_codex_app_meta_for_target "$1" 2>/dev/null || true)
+  [ -n "$meta" ] || return 1
+  thread_id=$(fm_meta_get "$meta" thread_id)
+  [ -n "$thread_id" ] || return 1
+  printf '%s' "$thread_id"
 }
 
 fm_backend_of_selector() {  # <raw-target> <resolved-target> <state-dir>
@@ -181,6 +216,8 @@ fm_backend_source() {  # <name>
         . "$FM_BACKEND_LIB_DIR/backends/herdr.sh"
         _FM_BACKEND_HERDR_SOURCED=1
       fi
+      ;;
+    codex-app)
       ;;
   esac
 }
@@ -218,6 +255,13 @@ fm_backend_resolve_selector() {  # <raw-target> <state-dir>
       return 0
       ;;
     *)
+      meta=$(fm_backend_meta_for_window "$raw" "$state" 2>/dev/null || true)
+      if [ -n "$meta" ]; then
+        window=$(fm_meta_get "$meta" window)
+        [ -n "$window" ] || { echo "error: no window recorded in $meta" >&2; return 1; }
+        printf '%s' "$window"
+        return 0
+      fi
       fm_backend_source tmux || return 1
       fm_backend_tmux_resolve_bare_selector "$raw"
       ;;
@@ -233,24 +277,39 @@ fm_backend_resolve_selector() {  # <raw-target> <state-dir>
 
 # fm_backend_capture: bounded plain-text session capture.
 fm_backend_capture() {  # <backend> <target> <lines>
-  local backend=$1
+  local backend=$1 thread_id
   shift
   fm_backend_source "$backend" || return 1
   case "$backend" in
     tmux) fm_backend_tmux_capture "$@" ;;
     herdr) fm_backend_herdr_capture "$@" ;;
+    codex-app)
+      thread_id=$(fm_backend_codex_app_thread_id "$1" 2>/dev/null || true)
+      [ -n "$thread_id" ] || { echo "error: no thread_id recorded for Codex App target '$1'" >&2; return 1; }
+      "$(fm_backend_codex_app_helper)" capture "$thread_id" "$2"
+      ;;
     *) echo "error: no capture implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
 
 # fm_backend_send_key: one named special key (Enter, Escape, C-c, ...).
 fm_backend_send_key() {  # <backend> <target> <key>
-  local backend=$1
+  local backend=$1 thread_id key
   shift
   fm_backend_source "$backend" || return 1
   case "$backend" in
     tmux) fm_backend_tmux_send_key "$@" ;;
     herdr) fm_backend_herdr_send_key "$@" ;;
+    codex-app)
+      thread_id=$(fm_backend_codex_app_thread_id "$1" 2>/dev/null || true)
+      [ -n "$thread_id" ] || { echo "error: no thread_id recorded for Codex App target '$1'" >&2; return 1; }
+      key=$2
+      case "$key" in
+        Escape|C-c) "$(fm_backend_codex_app_helper)" interrupt "$thread_id" ;;
+        Enter) "$(fm_backend_codex_app_helper)" send "$thread_id" "" ;;
+        *) echo "error: unsupported Codex App key '$key'" >&2; return 1 ;;
+      esac
+      ;;
     *) echo "error: no send-key implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -259,12 +318,25 @@ fm_backend_send_key() {  # <backend> <target> <key>
 # retrying only the submission (never retyping). Echoes the verdict
 # (empty|pending|unknown|send-failed for the tmux and herdr adapters).
 fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sleep> <settle>
-  local backend=$1
+  local backend=$1 thread_id
   shift
   fm_backend_source "$backend" || return 1
   case "$backend" in
     tmux) fm_backend_tmux_send_text_submit "$@" ;;
     herdr) fm_backend_herdr_send_text_submit "$@" ;;
+    codex-app)
+      thread_id=$(fm_backend_codex_app_thread_id "$1" 2>/dev/null || true)
+      if [ -z "$thread_id" ]; then
+        echo "error: no thread_id recorded for Codex App target '$1'" >&2
+        printf 'send-failed'
+        return 0
+      fi
+      if "$(fm_backend_codex_app_helper)" send "$thread_id" "$2"; then
+        printf ''
+      else
+        printf 'send-failed'
+      fi
+      ;;
     *) echo "error: no send-text implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -279,6 +351,7 @@ fm_backend_kill() {  # <backend> <target>
   case "$backend" in
     tmux) fm_backend_tmux_kill "$@" ;;
     herdr) fm_backend_herdr_kill "$@" ;;
+    codex-app) return 0 ;;
     *) echo "error: no kill implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }

@@ -562,6 +562,7 @@ fi
 # same $T ("target") string that every downstream operation (send/capture/kill)
 # already treats as opaque per-backend routing (fm_backend_resolve_selector).
 W="fm-$ID"
+CODEX_APP_PENDING_ACTION=
 case "$BACKEND" in
   tmux)
     SES=$(fm_backend_tmux_container_ensure)
@@ -581,6 +582,19 @@ EOF
       exit 1
     fi
     T="$HERDR_SES:$HERDR_PANE_ID"
+    ;;
+  codex-app)
+    [ "$KIND" != secondmate ] || { echo "error: FM_BACKEND=codex-app does not support --secondmate; use tmux for secondmates" >&2; exit 1; }
+    case "$ARG3" in
+      *' '*) echo "error: FM_BACKEND=codex-app does not support raw launch commands; use the codex harness" >&2; exit 1 ;;
+    esac
+    case "$HARNESS" in
+      codex*) ;;
+      *) echo "error: FM_BACKEND=codex-app supports only the codex harness (got '$HARNESS')" >&2; exit 1 ;;
+    esac
+    T="$W"
+    WT=""
+    CODEX_APP_PENDING_ACTION=create_thread_or_fork_thread
     ;;
 esac
 spawn_send_text_line() {  # <target> <text>
@@ -607,7 +621,7 @@ spawn_send_key() {  # <target> <key>
     herdr) fm_backend_herdr_send_key "$1" "$2" ;;
   esac
 }
-if [ "$KIND" != secondmate ]; then
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != codex-app ]; then
   spawn_send_text_line "$T" 'treehouse get'
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
@@ -650,12 +664,15 @@ if [ "$KIND" != secondmate ]; then
   fi
 fi
 
-# Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
-# create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
-# Nested (not a bare /tmp/fm-<id>/gotmp) so other per-task temp can live alongside
-# later, and teardown cleans one deterministic path. GOTMPDIR (not TMPDIR) is the
-# targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
-TASK_TMP="/tmp/fm-$ID"
+# Per-task temp root with Go's build temp nested at gotmp/. Go won't create
+# GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
+# tmux/herdr keep the upstream /tmp/fm-<id> convention. codex-app keeps temp
+# under state/tmp so Codex Desktop work stays inside the FirstMate install.
+# GOTMPDIR, not TMPDIR, is the targeted knob.
+case "$BACKEND" in
+  codex-app) TASK_TMP="$STATE/tmp/fm-$ID" ;;
+  *) TASK_TMP="/tmp/fm-$ID" ;;
+esac
 mkdir -p "$TASK_TMP/gotmp"
 
 # Per-harness turn-end hook: a file that touches state/<id>.turn-ended when the
@@ -671,7 +688,7 @@ exclude_path() {
   mkdir -p "$(dirname "$EXCL")"
   grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
 }
-if [ "$KIND" != secondmate ]; then
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != codex-app ]; then
   case "$HARNESS" in
     claude*)
       mkdir -p "$WT/.claude"
@@ -798,11 +815,25 @@ fi
     echo "herdr_tab_id=$HERDR_TAB_ID"
     echo "herdr_pane_id=$HERDR_PANE_ID"
   fi
+  if [ "$BACKEND" = codex-app ]; then
+    echo "codex_app_thread_state=pending"
+    echo "codex_app_pending_action=$CODEX_APP_PENDING_ACTION"
+    echo "codex_app_transport=visible-thread"
+    echo "codex_app_brief=$BRIEF"
+  fi
   if [ "$KIND" = secondmate ]; then
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
 } > "$STATE/$ID.meta"
+
+if [ "$BACKEND" = codex-app ]; then
+  "$FM_ROOT/bin/fm-codex-app" prepare "$ID" "$W" "$BRIEF" >/dev/null
+  echo "prepared $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO backend=$BACKEND thread=$W"
+  echo "next: use Codex App create_thread or fork_thread for $W, send the brief at $BRIEF, then run:"
+  echo "      bin/fm-codex-app record-thread $ID <thread-id> [--worktree <path>] [--pending-worktree-id <id>]"
+  exit 0
+fi
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")

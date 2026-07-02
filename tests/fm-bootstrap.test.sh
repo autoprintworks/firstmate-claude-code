@@ -156,6 +156,37 @@ ROWS
   pass "bootstrap enforces no-mistakes minimum version"
 }
 
+test_codex_app_bootstrap_skips_terminal_backend_tools() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/codex-app-backend"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(fm_fakebin "$case_dir")
+  fm_fake_exit0 "$fakebin" node chrome-devtools-axi lavish-axi
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fakebin/gh"
+  cat > "$fakebin/no-mistakes" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' 'no-mistakes version v1.31.2 (fake)'
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fakebin/no-mistakes"
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_BACKEND=codex-app "$ROOT/bin/fm-bootstrap.sh")
+  [ -z "$out" ] || fail "codex-app bootstrap should not require tmux/treehouse/gh-axi, got: $out"
+  pass "bootstrap codex-app backend skips tmux, treehouse, and raw gh-axi requirements"
+}
+
 test_crew_dispatch_active_rules_are_surfaced() {
   local case_dir fakebin out expect
   case_dir="$TMP_ROOT/dispatch-active"
@@ -205,5 +236,6 @@ ROWS
 
 test_bootstrap_reporting
 test_no_mistakes_min_version
+test_codex_app_bootstrap_skips_terminal_backend_tools
 test_crew_dispatch_active_rules_are_surfaced
 test_crew_dispatch_validation

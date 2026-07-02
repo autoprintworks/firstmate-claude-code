@@ -62,6 +62,8 @@ WT=$(grep '^worktree=' "$META" | cut -d= -f2-)
 T=$(grep '^window=' "$META" | cut -d= -f2-)
 PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
 BACKEND=$(fm_backend_of_meta "$META")
+CODEX_APP_THREAD_ID=$(grep '^thread_id=' "$META" | tail -1 | cut -d= -f2- || true)
+CODEX_APP_ARCHIVED=$(grep '^codex_app_archived=' "$META" | tail -1 | cut -d= -f2- || true)
 HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
 PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 # tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
@@ -108,7 +110,7 @@ remove_grok_turnend_auth() {
 pr_number_from_branch() {
   local branch=$1 out n
   [ -n "$branch" ] && [ "$branch" != HEAD ] || return 1
-  out=$( cd "$WT" && gh-axi pr list --state all --head "$branch" --limit 1 2>/dev/null ) || return 1
+  out=$( cd "$WT" && "$FM_ROOT/bin/fm-gh-axi" pr list --state all --head "$branch" --limit 1 2>/dev/null ) || return 1
   n=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*\([0-9][0-9]*\),.*/\1/p' | head -1)
   [ -n "$n" ] || return 1
   printf '%s' "$n"
@@ -185,7 +187,7 @@ pr_is_merged() {
     target=$(pr_number_from_branch "$branch") || return 1
   fi
   [ -n "$target" ] || return 1
-  view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
+  view=$(cd "$WT" && "$FM_ROOT/bin/fm-gh-axi" pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
   state=${view%%$'\t'*}
   head=${view#*$'\t'}
   [ "$state" != "$view" ] || return 1
@@ -580,6 +582,30 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
   cleanup_firstmate_home_children "$HOME_PATH"
 fi
 
+if [ "$BACKEND" = codex-app ] && [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
+  REPORT="$DATA/$ID/report.md"
+  if [ ! -f "$REPORT" ]; then
+    echo "REFUSED: scout task $ID has no report at $REPORT." >&2
+    echo "The report is the work product. Have the crewmate write it (or get the captain's explicit OK to discard, then --force)." >&2
+    exit 1
+  fi
+fi
+
+if [ "$BACKEND" = codex-app ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
+  if [ -z "$WT" ] || [ ! -d "$WT" ]; then
+    echo "REFUSED: Codex App ship task $ID has no known app-owned worktree path." >&2
+    echo "Record the visible thread worktree with bin/fm-codex-app record-thread, land the work, or get the captain's explicit OK to discard, then --force." >&2
+    exit 1
+  fi
+  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
+  proj_top=$(git -C "$PROJ" rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -z "$wt_top" ] || [ "$wt_top" = "$proj_top" ]; then
+    echo "REFUSED: Codex App ship task $ID is not recorded in a separate app-owned git worktree: $WT" >&2
+    echo "Record the visible thread worktree, land the work, or get the captain's explicit OK to discard, then --force." >&2
+    exit 1
+  fi
+fi
+
 if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   if [ "$KIND" = secondmate ]; then
     :
@@ -642,8 +668,16 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
+if [ "$BACKEND" = codex-app ] && [ -n "$CODEX_APP_THREAD_ID" ] && [ "$CODEX_APP_ARCHIVED" != 1 ] && [ "$FORCE" != "--force" ]; then
+  echo "REFUSED: Codex App thread $CODEX_APP_THREAD_ID is not marked archived." >&2
+  echo "Use set_thread_archived(threadId=$CODEX_APP_THREAD_ID, archived=true), then run: bin/fm-codex-app mark-archived $ID" >&2
+  exit 1
+fi
+
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
+WT_IS_GIT_WORKTREE=0
 if [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
+  WT_IS_GIT_WORKTREE=1
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   if [ "$branch" != "HEAD" ]; then
     if git -C "$WT" checkout --detach -q 2>/dev/null; then
@@ -652,10 +686,23 @@ if [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   fi
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
   rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
-  # Kills remaining processes in the worktree (including the agent), resets, returns
-  # to pool. treehouse resolves the pool from the working directory, so run it from
-  # the project.
-  ( cd "$PROJ" && treehouse return --force "$WT" )
+fi
+
+if [ "$WT_IS_GIT_WORKTREE" = 1 ]; then
+  case "$BACKEND" in
+    codex-app)
+      case "$WT" in
+        "$STATE/codex-app-worktrees/"*) git -C "$PROJ" worktree remove --force "$WT" >/dev/null ;;
+        *) : ;;
+      esac
+      ;;
+    *)
+      # Kills remaining processes in the worktree (including the agent), resets,
+      # returns to pool. treehouse resolves the pool from the working directory,
+      # so run it from the project.
+      ( cd "$PROJ" && treehouse return --force "$WT" )
+      ;;
+  esac
 fi
 
 fm_backend_kill "$BACKEND" "$T" 2>/dev/null || true
@@ -669,6 +716,7 @@ remove_grok_turnend_auth "$STATE" "$ID"
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
+rm -f "$STATE/$ID.codex-app.capture"
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi

@@ -14,15 +14,19 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 ID=$1
 URL=$2
 
+shell_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
+}
+
 META="$STATE/$ID.meta"
 if [ -f "$META" ]; then
   WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
   PR_HEAD=
   if [ -n "$WT" ] && [ -d "$WT" ]; then
-    if command -v gh >/dev/null 2>&1; then
-      if REMOTE_HEAD=$(cd "$WT" && gh pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null); then
-        PR_HEAD=$REMOTE_HEAD
-      fi
+    if REMOTE_HEAD=$(cd "$WT" && "$FM_ROOT/bin/fm-gh-axi" pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null); then
+      PR_HEAD=$REMOTE_HEAD
     fi
   fi
   if ! grep -qxF "pr=$URL" "$META"; then
@@ -33,8 +37,11 @@ if [ -f "$META" ]; then
   fi
 fi
 
+sq_fm_root=$(shell_quote "$FM_ROOT")
+sq_url=$(shell_quote "$URL")
 cat > "$STATE/$ID.check.sh" <<EOF
-state=\$(gh pr view "$URL" --json state -q .state 2>/dev/null)
+FM_ROOT=$sq_fm_root
+state=\$("\$FM_ROOT/bin/fm-gh-axi" pr view $sq_url --json state -q .state 2>/dev/null)
 [ "\$state" = "MERGED" ] && echo "merged"
 EOF
 echo "armed: state/$ID.check.sh polls $URL"

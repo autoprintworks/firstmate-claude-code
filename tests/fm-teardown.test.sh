@@ -182,12 +182,17 @@ land_on_origin_main() {
 # Override GitHub lookups to report PR 7 as merged with the supplied head.
 add_gh_pr_merged_for_head() {
   local case_dir=$1 head=$2
-  cat > "$case_dir/fakebin/gh-axi" <<'SH'
+  cat > "$case_dir/fakebin/gh-axi" <<SH
 #!/usr/bin/env bash
-case "${1:-} ${2:-}" in
+case "\${1:-} \${2:-}" in
   "pr list")
     printf '%s\n' "count: 1 (showing first 1)" "pull_requests[1]{number,state}:" "  7,merged" ; exit 0 ;;
   "pr view")
+    case " \$* " in
+      *"state,headRefOid"*) printf '%s\t%s\n' 'MERGED' '$head' ; exit 0 ;;
+      *"headRefOid"*) printf '%s\n' '$head' ; exit 0 ;;
+      *"state"*) printf '%s\n' 'MERGED' ; exit 0 ;;
+    esac
     printf '%s\n' "pull_request:" "  number: 7" "  state: merged" '  merged: "2026-06-26T00:00:00Z"' ; exit 0 ;;
 esac
 exit 0
@@ -262,6 +267,7 @@ run_teardown() {
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
+  FM_GH_AXI_SHIM="$case_dir/fakebin/gh-axi" \
   PATH="$case_dir/fakebin:$PATH" \
     "$TEARDOWN" task-x1 "$@"
 }
@@ -524,6 +530,7 @@ test_pr_check_does_not_refresh_stale_pr_head() {
 
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_GH_AXI_SHIM="$case_dir/fakebin/gh-axi" \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_CHECK" task-x1 https://github.com/example/repo/pull/7 >/dev/null
 
@@ -532,6 +539,7 @@ test_pr_check_does_not_refresh_stale_pr_head() {
 
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_GH_AXI_SHIM="$case_dir/fakebin/gh-axi" \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_CHECK" task-x1 https://github.com/example/repo/pull/7 >/dev/null
 
@@ -561,6 +569,7 @@ test_pr_check_records_remote_head_when_local_lags() {
 
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_GH_AXI_SHIM="$case_dir/fakebin/gh-axi" \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_CHECK" task-x1 https://github.com/example/repo/pull/7 >/dev/null
 

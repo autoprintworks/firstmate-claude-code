@@ -77,7 +77,7 @@ config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "de
 config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; firstmate-maintained but human-editable natural-language rules that choose a per-task harness/model/effort profile (section 4). Inherited by secondmate homes
 config/secondmate-harness  harness the PRIMARY uses to launch SECONDMATE agents, optionally followed by a model and effort token on the same line ("<harness> [<model>] [<effort>]"; section 4); LOCAL, gitignored; absent or "default" harness falls back to config/crew-harness then firstmate's own. The primary's own setting; NOT inherited into secondmate homes (secondmates do not spawn secondmates)
 config/backlog-backend  backlog backend override; LOCAL, gitignored; absent or "tasks-axi" = default tasks-axi backend, "manual" = force hand-editing; inherited by secondmate homes (section 10)
-config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend, herdr is a second, experimental backend (docs/herdr-backend.md); not inherited into secondmate homes
+config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend, herdr is a second, experimental backend (docs/herdr-backend.md), and codex-app prepares visible Codex Desktop threads through the host app tools; not inherited into secondmate homes
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history
@@ -450,6 +450,7 @@ bin/fm-spawn.sh <id> projects/<repo> grok        # per-task harness override
 bin/fm-spawn.sh <id> projects/<repo> --harness codex --model gpt-5.5 --effort high   # explicit profile axes
 bin/fm-spawn.sh <id> projects/<repo> --backend tmux   # explicit runtime backend; tmux is the verified reference backend
 bin/fm-spawn.sh <id> projects/<repo> --backend herdr  # experimental herdr backend (docs/herdr-backend.md); version-gates at spawn
+bin/fm-spawn.sh <id> projects/<repo> codex --backend codex-app  # prepare a visible Codex Desktop thread; create/fork it with the app tools, then record the returned thread id
 bin/fm-spawn.sh <id> projects/<repo> --scout     # scout task; records kind=scout in meta
 bin/fm-spawn.sh <id> --secondmate                 # launch a registered persistent secondmate in its home
 bin/fm-spawn.sh <id> <firstmate-home> --secondmate   # launch or recover an explicit secondmate home
@@ -467,6 +468,15 @@ When `--model` or `--effort` is omitted, the corresponding meta value is `defaul
 For `kind=secondmate`, the same script launches in the registered or explicit firstmate home instead of running `treehouse get` for a project, records `home=` and `projects=`, and uses the charter brief as the launch prompt.
 
 For ship and scout tasks, the script creates the runtime endpoint (a tmux window by default, or a herdr tab/pane when `backend=herdr`), runs `treehouse get`, waits for the worktree subshell, asserts the resolved worktree is a genuine isolated worktree distinct from the primary checkout (aborting the spawn otherwise, to prevent the worktree tangle of section 8), installs the turn-end hook, records `state/<id>.meta`, and launches the agent with the brief.
+For `backend=codex-app`, `fm-spawn` does not launch a headless `codex app-server` and does not run `treehouse get`.
+It prepares FirstMate state, writes `backend=codex-app` plus `codex_app_pending_action=create_thread_or_fork_thread`, and prints the brief path.
+Then use Codex Desktop app tools to create the visible worker under the matching saved project: call `list_projects`, choose the project whose path matches `projects/<repo>`, and call `create_thread` with that project worktree target.
+If current conversation context must be preserved, call `fork_thread` instead.
+Do not use projectless threads for repo work.
+After the host returns a thread id, run `bin/fm-codex-app record-thread <id> <thread-id> --worktree <thread-cwd>` when the cwd is known; if the host returns only a pending worktree id, run `bin/fm-codex-app record-pending <id> <pending-worktree-id>` and record the thread later.
+Use `read_thread` as the source of truth for progress, `send_message_to_thread` for steering, and `set_thread_archived` before `bin/fm-codex-app mark-archived <id>` and teardown.
+`bin/fm-codex-app adopt-thread` is only for reconciling an already-visible Codex Desktop thread into FirstMate state.
+The helper is a local ledger and intentionally refuses to masquerade as the Codex Desktop host API.
 For grok, the turn-end hook is one firstmate-owned global hook under `$GROK_HOME/hooks/`, or `~/.grok/hooks/` when `GROK_HOME` is unset, activated only when the worktree holds the per-task `.fm-grok-turnend` token pointer that matches `state/<id>.grok-turnend-token`; teardown removes the pointer and token.
 For `kind=secondmate`, the script creates the same kind of runtime endpoint but starts directly in the persistent home.
 Before launching a secondmate, the script fast-forwards its home worktree to firstmate's own current default-branch commit, so a freshly spawned or recovery-respawned secondmate always starts on firstmate's current version.

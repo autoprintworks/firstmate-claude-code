@@ -16,7 +16,7 @@
 #
 # gh-axi pr merge expects a PR number and --repo <owner>/<repo>; it does not
 # parse a full https://github.com/<owner>/<repo>/pull/<n> URL. This script
-# parses the URL and invokes gh-axi in the form it accepts.
+# parses the URL and invokes FirstMate's gh-axi bridge in the form it accepts.
 #
 # Merge method: defaults to --squash when the caller passes none of --squash,
 # --merge, --rebase, or --method after the optional -- separator. An explicit
@@ -87,4 +87,4 @@ if ! caller_has_merge_method "$@"; then
   merge_args=(--squash)
 fi
 
-gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "${merge_args[@]}" "$@"
+"$FM_ROOT/bin/fm-gh-axi" pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "${merge_args[@]}" "$@"

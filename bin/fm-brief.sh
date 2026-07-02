@@ -60,6 +60,12 @@ shell_quote() {
 }
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
+FM_ROOT_WIN=$FM_ROOT
+if command -v cygpath >/dev/null 2>&1; then
+  FM_ROOT_WIN=$(cygpath -w "$FM_ROOT" 2>/dev/null || printf '%s' "$FM_ROOT")
+fi
+GH_AXI_BASH="$FM_ROOT/bin/fm-gh-axi"
+GH_AXI_PWSH="$FM_ROOT_WIN\\bin\\fm-gh-axi.ps1"
 
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
@@ -144,7 +150,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 # Rules
 1. Never push to any remote and never open a PR.
 2. Stay inside this worktree; the only files you may write outside it are the report and the status file below.
-3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
+3. Use FirstMate's gh-axi bridge for GitHub operations and chrome-devtools-axi for browser operations. In bash, run \`$GH_AXI_BASH ...\`. In PowerShell, run \`& "$GH_AXI_PWSH" ...\`. On Windows, do not run raw \`gh-axi\`, \`npx.cmd\`, \`gh.cmd\`, \`cmd.exe /c gh-axi\`, or PowerShell wrapper shims.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
    States: working, needs-decision, blocked, done, failed.
@@ -179,7 +185,7 @@ case "$MODE" in
 # Definition of done
 This project ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
-When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
+When it is implemented and committed, push your branch and open a PR with FirstMate's gh-axi bridge, then append \`done: PR {url}\` to the status file and stop.
 Do NOT run /no-mistakes. The captain reviews and merges the PR; firstmate relays it.
 EOF
 )
@@ -240,7 +246,7 @@ If the top-level path is the primary checkout or not the worktree you were launc
 # Rules
 $RULE1
 2. Stay inside this worktree; modify nothing outside it.
-3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
+3. Use FirstMate's gh-axi bridge for GitHub operations and chrome-devtools-axi for browser operations. In bash, run \`$GH_AXI_BASH ...\`. In PowerShell, run \`& "$GH_AXI_PWSH" ...\`. On Windows, do not run raw \`gh-axi\`, \`npx.cmd\`, \`gh.cmd\`, \`cmd.exe /c gh-axi\`, or PowerShell wrapper shims.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
    States: working, needs-decision, blocked, done, failed.
