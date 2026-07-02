@@ -22,10 +22,29 @@ make_fake_toolchain() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
   fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/git"
   cat > "$fakebin/gh" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
+  [ "${FM_FAKE_GH_AUTH_STATUS:-0}" = 0 ] && exit 0
+  printf '%s\n' "${FM_FAKE_GH_AUTH_STATUS_ERROR:-auth status failed}" >&2
+  exit "${FM_FAKE_GH_AUTH_STATUS:-1}"
+fi
+if [ "${1:-}" = auth ] && [ "${2:-}" = token ]; then
+  [ -n "${FM_FAKE_GH_AUTH_TOKEN:-}" ] || exit 1
+  printf '%s\n' "$FM_FAKE_GH_AUTH_TOKEN"
   exit 0
+fi
+if [ "${1:-}" = api ] && [ "${2:-}" = user ]; then
+  case "${FM_FAKE_GH_API_RESULT:-ok}" in
+    ok) printf '%s\n' '{"login":"autoprintworks"}'; exit 0 ;;
+    network) printf '%s\n' 'Get "https://api.github.com/user": dial tcp 20.26.156.210:443: connectex: An attempt was made to access a socket in a way forbidden by its access permissions.' >&2; exit 1 ;;
+    bad) printf '%s\n' 'gh: Bad credentials (HTTP 401)' >&2; exit 1 ;;
+  esac
 fi
 exit 0
 SH
@@ -128,6 +147,33 @@ manual backlog backend suppresses missing tasks-axi^1^-^manual^empty^^
 manual backlog backend suppresses tasks-axi availability^1^0.1.1^manual^empty^^
 ROWS
   pass "bootstrap reports treehouse lease + tasks-axi default/backend contracts"
+}
+
+test_gh_auth_network_fallback() {
+  local label token api mode case_dir fakebin out n
+  n=0
+  while IFS='^' read -r label token api mode; do
+    [ -n "$label" ] || continue
+    n=$((n + 1))
+    case_dir="$TMP_ROOT/gh-auth-$n"
+    mkdir -p "$case_dir/home/config"
+    printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+    fakebin=$(make_fake_toolchain "$case_dir")
+    out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+      FM_BACKEND=codex-app FM_FAKE_GH_AUTH_STATUS=1 FM_FAKE_GH_AUTH_TOKEN="$token" \
+      FM_FAKE_GH_API_RESULT="$api" "$ROOT/bin/fm-bootstrap.sh")
+    case "$mode" in
+      empty)
+        [ -z "$out" ] || fail "$label: expected silence, got: $out" ;;
+      needs)
+        [ "$out" = "NEEDS_GH_AUTH" ] || fail "$label: expected NEEDS_GH_AUTH, got: $out" ;;
+    esac
+  done <<'ROWS'
+token present with sandboxed network is accepted^gho_fake_token^network^empty
+missing token still needs auth^^network^needs
+bad credentials still needs auth^gho_fake_token^bad^needs
+ROWS
+  pass "bootstrap treats sandboxed gh network failure as token-present, not missing auth"
 }
 
 test_no_mistakes_min_version() {
@@ -240,6 +286,7 @@ ROWS
 }
 
 test_bootstrap_reporting
+test_gh_auth_network_fallback
 test_no_mistakes_min_version
 test_codex_app_bootstrap_skips_terminal_backend_tools
 test_crew_dispatch_active_rules_are_surfaced

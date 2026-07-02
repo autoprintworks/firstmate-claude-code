@@ -100,7 +100,13 @@ Install `jq` to unblock the full bootstrap test file.
 
 Install `tasks-axi` or set the backlog backend to manual for this reset phase.
 
-Run `gh auth login` or otherwise repair GitHub CLI authentication before GitHub-backed FirstMate work.
+`gh auth login` was completed for `autoprintworks` on July 2, 2026.
+
+Escalated `gh auth status` and `gh api user --jq .login` verify the token and scopes.
+
+Non-escalated Codex shell calls can still report the token as invalid because GitHub API access is blocked by the sandbox.
+
+Bootstrap now treats a token-present sandbox network failure as auth present, not as `NEEDS_GH_AUTH`.
 
 Create or restore `data/projects.md` when ready to define project delivery modes.
 

@@ -217,6 +217,28 @@ no_mistakes_compatible() {
   [ "$patch" -ge "$NO_MISTAKES_MIN_PATCH" ]
 }
 
+gh_auth_ready() {
+  local token api_err rc
+  command -v gh >/dev/null 2>&1 || return 1
+  gh auth status >/dev/null 2>&1 && return 0
+  token=$(gh auth token 2>/dev/null || true)
+  [ -n "$token" ] || return 1
+  mkdir -p "$STATE" 2>/dev/null || true
+  api_err=$(mktemp "$STATE/.gh-auth-api.XXXXXX" 2>/dev/null || mktemp) || return 1
+  gh api user >/dev/null 2>"$api_err"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$api_err" 2>/dev/null || true
+    return 0
+  fi
+  if grep -qiE 'socket|connectex|dial tcp|network|timed out|timeout|could not resolve|connection refused|TLS handshake' "$api_err"; then
+    rm -f "$api_err" 2>/dev/null || true
+    return 0
+  fi
+  rm -f "$api_err" 2>/dev/null || true
+  return 1
+}
+
 # Write CONTENT to DEST only when it differs, so re-running bootstrap does not
 # churn mtimes or duplicate generated files (idempotence).
 write_if_changed() {
@@ -405,7 +427,7 @@ fi
 if command -v no-mistakes >/dev/null 2>&1 && ! no_mistakes_compatible; then
   echo "MISSING: no-mistakes (install: $(install_cmd no-mistakes))"
 fi
-gh auth status >/dev/null 2>&1 || echo "NEEDS_GH_AUTH"
+gh_auth_ready || echo "NEEDS_GH_AUTH"
 # Worktree-tangle check: the firstmate primary checkout (FM_ROOT) must sit on its
 # default branch, not a feature branch (see fm-tangle-lib.sh). Scoped to the
 # primary only; detached-HEAD worktrees and secondmate homes never trip it.
