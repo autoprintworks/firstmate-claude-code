@@ -88,6 +88,38 @@ healthy_watcher() {
   return 0
 }
 
+pid_ppid() {
+  local pid=$1 out
+  out=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d '[:space:]' || true)
+  case "$out" in
+    ''|*[!0-9]*) ;;
+    *) printf '%s\n' "$out"; return 0 ;;
+  esac
+  out=$(ps -p "$pid" -f 2>/dev/null | awk 'NR == 2 { print $3; exit }')
+  case "$out" in
+    ''|*[!0-9]*) return 1 ;;
+    *) printf '%s\n' "$out" ;;
+  esac
+}
+
+pid_is_descendant_of() {
+  local pid=$1 ancestor=$2 cur ppid hops
+  [ "$pid" = "$ancestor" ] && return 0
+  cur=$pid
+  hops=0
+  while [ "$hops" -lt 30 ]; do
+    ppid=$(pid_ppid "$cur") || return 1
+    [ "$ppid" = "$ancestor" ] && return 0
+    case "$ppid" in
+      ''|0|1) return 1 ;;
+    esac
+    [ "$ppid" = "$cur" ] && return 1
+    cur=$ppid
+    hops=$((hops + 1))
+  done
+  return 1
+}
+
 report_healthy() {
   local age
   age=$(fm_path_age "$BEAT")
@@ -146,6 +178,12 @@ fi
 child=
 child_out=
 cleanup_child() {
+  local lock_pid
+  lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
+  if [ -n "$child" ] && [ -n "$lock_pid" ] && [ "$lock_pid" != "$child" ] \
+    && fm_pid_alive "$lock_pid" && pid_is_descendant_of "$lock_pid" "$child"; then
+    kill -TERM "$lock_pid" 2>/dev/null || true
+  fi
   if [ -n "$child" ] && fm_pid_alive "$child"; then
     kill -TERM "$child" 2>/dev/null || true
   fi
@@ -170,8 +208,8 @@ child_done=0
 deadline=$(( $(date +%s) + CONFIRM_TIMEOUT ))
 while :; do
   if healthy_watcher; then
-    if [ "$HEALTHY_PID" = "$child" ]; then
-      echo "watcher: started pid=$child (beacon fresh)"
+    if [ "$HEALTHY_PID" = "$child" ] || pid_is_descendant_of "$HEALTHY_PID" "$child"; then
+      echo "watcher: started pid=$HEALTHY_PID (beacon fresh)"
       wait "$child"
       rc=$?
       print_watch_output "$child_out"

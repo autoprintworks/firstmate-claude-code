@@ -158,7 +158,7 @@ test_lock_single_winner_under_concurrency() {
         printf "%s\n" "$$" >> "$3"
         # Stay alive so the held lock names a live pid for the whole window;
         # otherwise a late contender could legitimately reclaim a dead-pid lock.
-        sleep 1
+        sleep 5
       fi
     ' _ "$LIB" "$lockdir" "$marker" &
     pids="$pids $!"
@@ -208,7 +208,7 @@ test_lock_stale_steal_single_winner_under_concurrency() {
       . "$1"
       if fm_lock_try_acquire "$2"; then
         printf "%s\n" "${BASHPID:-$$}" >> "$3"
-        sleep 1
+        sleep 5
       fi
     ' _ "$LIB" "$lockdir" "$marker" &
     pids="$pids $!"
@@ -419,22 +419,37 @@ test_watcher_self_evicts_on_lock_takeover() {
   pid=$!
   i=0
   while [ "$i" -lt 50 ]; do
-    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] && break
+    lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    [ -n "$lock_pid" ] && is_live_non_zombie "$lock_pid" && break
     sleep 0.1
     i=$((i + 1))
   done
-  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] || fail "watcher did not record its own pid in the lock"
+  [ -n "$lock_pid" ] && is_live_non_zombie "$lock_pid" || fail "watcher did not record a live pid in the lock"
   # Simulate a second watcher taking over the singleton lock. $$ (the test
   # runner) is a live pid that is not the watcher.
-  printf '%s\n' "$$" > "$state/.watch.lock/pid"
-  wait_for_exit "$pid" 60 || fail "watcher did not self-evict after lock takeover"
+  i=0
+  while [ "$i" -lt 20 ]; do
+    { printf '%s\n' "$$" > "$state/.watch.lock/pid"; } 2>/dev/null \
+      && [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$$" ] \
+      && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$$" ] || fail "could not simulate lock takeover"
+  i=0
+  while [ "$i" -lt 60 ] && is_live_non_zombie "$lock_pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  ! is_live_non_zombie "$lock_pid" || fail "watcher did not self-evict after lock takeover"
+  wait_for_exit "$pid" 10 || fail "watcher launcher did not exit after lock takeover"
   lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
   [ "$lock_pid" = "$$" ] || fail "self-evicting watcher clobbered the new holder's lock (got '$lock_pid')"
   pass "watcher self-evicts when the lock pid no longer names it"
 }
 
 test_arm_reports_healthy_for_live_fresh_watcher() {
-  local dir state fakebin out armout i wpid status
+  local dir state fakebin out armout i wpid lock_pid status
   dir=$(make_case arm-healthy)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -445,20 +460,21 @@ test_arm_reports_healthy_for_live_fresh_watcher() {
   wpid=$!
   i=0
   while [ "$i" -lt 60 ]; do
-    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] && [ -e "$state/.last-watcher-beat" ] && break
+    lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    [ -n "$lock_pid" ] && is_live_non_zombie "$lock_pid" && [ -e "$state/.last-watcher-beat" ] && break
     sleep 0.1
     i=$((i + 1))
   done
-  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] || fail "seed watcher did not take the lock"
+  [ -n "$lock_pid" ] && is_live_non_zombie "$lock_pid" || fail "seed watcher did not take the lock"
   # Arming must confirm the existing watcher and NOT start a second one.
   status=0
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" "$WATCH_ARM" > "$armout" || status=$?
   [ "$status" -eq 0 ] || fail "arm did not exit zero for a healthy watcher (status $status)"
-  grep -F "watcher: healthy pid=$wpid" "$armout" >/dev/null || fail "arm did not report the live watcher as healthy"
+  grep -F "watcher: healthy pid=$lock_pid" "$armout" >/dev/null || fail "arm did not report the live watcher as healthy"
   ! grep -qF 'watcher: started' "$armout" || fail "arm started a second watcher behind a healthy one"
   ! grep -qF 'watcher: FAILED' "$armout" || fail "arm reported FAILED for a healthy watcher"
-  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] || fail "arm disturbed the healthy watcher's lock"
-  kill "$wpid" 2>/dev/null || true
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$lock_pid" ] || fail "arm disturbed the healthy watcher's lock"
+  kill "$wpid" "$lock_pid" 2>/dev/null || true
   wait "$wpid" 2>/dev/null || true
   pass "arm reports a live fresh watcher as healthy and exits zero"
 }
