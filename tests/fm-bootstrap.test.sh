@@ -69,10 +69,15 @@ SH
 
 add_real_jq() {
   local fakebin=$1 real_jq
-  real_jq=$(command -v jq 2>/dev/null) || fail "jq is required for dispatch profile validation tests"
+  real_jq=$(command -v jq 2>/dev/null || true)
+  if [ -z "$real_jq" ] && [ -x "$ROOT/.tools/bin/jq.exe" ]; then
+    real_jq="$ROOT/.tools/bin/jq.exe"
+  fi
+  [ -n "$real_jq" ] || fail "jq is required for dispatch profile validation tests"
   cat > "$fakebin/jq" <<SH
 #!/usr/bin/env bash
-exec '$real_jq' "\$@"
+set -o pipefail
+'$real_jq' "\$@" | sed 's/\r$//'
 SH
   chmod +x "$fakebin/jq"
 }
