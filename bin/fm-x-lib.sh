@@ -22,6 +22,10 @@
 #   fmx_context_registry_set <state> <request_id> <platform> <reply-max> [refresh]
 #                                - persist the durable per-request reply context;
 #                                refresh=1 resets its retention timestamp
+
+_FM_X_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fm-platform-lib.sh
+. "$_FM_X_LIB_DIR/fm-platform-lib.sh"
 #   fmx_offer_registry_claim <state> <request_id> - atomically claim the durable
 #                                one-wake offer marker; 0=new, 1=existing, 2=error
 #   fmx_context_registry_prune <state> - remove records older than seven days
@@ -109,7 +113,8 @@ fmx_single_link_file_mode_valid() {
   else
     mode=$(stat -c %a "$file" 2>/dev/null) || return 1
   fi
-  [ "$mode" = "$expected_mode" ]
+  fm_platform_mode_compatible "$expected_mode" "$mode" file || return 1
+  return 0
 }
 
 fmx_private_artifact_dir_device() {
@@ -122,7 +127,7 @@ fmx_private_artifact_dir_device() {
     mode=$(stat -c %a "$dir" 2>/dev/null) || return 1
     device=$(stat -c %d "$dir" 2>/dev/null) || return 1
   fi
-  [ "$mode" = 700 ] || return 1
+  fm_platform_mode_compatible 700 "$mode" dir || return 1
   printf '%s\n' "$device"
 }
 

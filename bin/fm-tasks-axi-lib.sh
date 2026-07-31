@@ -11,6 +11,13 @@
 # Absent or any other value keeps the default tasks-axi backend path, falling
 # back to manual mutation when the tool is not compatible.
 
+if [ -n "${FM_ROOT:-}" ] && [ -d "$FM_ROOT/.tools/bin" ]; then
+  case ":$PATH:" in
+    *":$FM_ROOT/.tools/bin:"*) ;;
+    *) PATH="$FM_ROOT/.tools/bin:$PATH"; export PATH ;;
+  esac
+fi
+
 fm_tasks_axi_version_parts() {
   local output
   command -v tasks-axi >/dev/null 2>&1 || return 1

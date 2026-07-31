@@ -520,7 +520,15 @@ run_check_capture() {
   FM_ACTIVE_CHECK_PID=$!
   FM_ACTIVE_CHECK_PGID=$FM_ACTIVE_CHECK_PID
   set +m
-  pgid=$(ps -o pgid= -p "$FM_ACTIVE_CHECK_PID" 2>/dev/null | tr -d '[:space:]')
+  case "${_FM_UNAME:-$(uname 2>/dev/null || true)}" in
+    MINGW*|MSYS*|CYGWIN*)
+      # MSYS reports the Windows wrapper's process group rather than the Bash
+      # job leader used by $!. Own and stop the bounded timeout process by PID.
+      pgid=
+      FM_ACTIVE_CHECK_PGID=
+      ;;
+    *) pgid=$(ps -o pgid= -p "$FM_ACTIVE_CHECK_PID" 2>/dev/null | tr -d '[:space:]') ;;
+  esac
   trap 'exit 1' HUP INT TERM
   if [ -n "$pgid" ] && [ "$pgid" != "$FM_ACTIVE_CHECK_PGID" ]; then
     fm_active_check_stop || true
@@ -757,7 +765,8 @@ while :; do
           host=$FM_PR_POLL_SNAPSHOT_HOST
           path=$FM_PR_POLL_SNAPSHOT_PATH
           number=$FM_PR_POLL_SNAPSHOT_NUMBER
-          run_check_capture "$SCRIPT_DIR/fm-pr-poll.sh" --validated \
+          FM_GH_AXI_BRIDGE="${FM_GH_AXI_BRIDGE:-$SCRIPT_DIR/fm-gh-axi}" \
+            run_check_capture "$SCRIPT_DIR/fm-pr-poll.sh" --validated \
             "$provider" "$url" "$host" "$path" "$number" || exit 1
           out=$FM_CHECK_RESULT
         elif fm_custom_check_snapshot_prepare "$STATE" "$id"; then

@@ -17,6 +17,10 @@
 # The receipt binds the terminal observation to the canonical registration and
 # lets a restart finish fixed-path removal without executing state-file bytes.
 
+_FM_PR_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fm-platform-lib.sh
+. "$_FM_PR_LIB_DIR/fm-platform-lib.sh"
+
 FM_PR_PROVIDER=
 FM_PR_URL=
 FM_PR_HOST=
@@ -264,11 +268,20 @@ fm_pr_sha256() {
 }
 
 fm_pr_private_file_valid() {
-  local path=$1 mode=$2 device=$3
+  local path=$1 mode=$2 device=$3 actual_mode
   [ -f "$path" ] && [ ! -L "$path" ] || return 1
-  [ "$(fm_pr_file_mode "$path")" = "$mode" ] || return 1
+  actual_mode=$(fm_pr_file_mode "$path") || return 1
+  fm_platform_mode_compatible "$mode" "$actual_mode" file || return 1
   [ "$(fm_pr_file_device "$path")" = "$device" ] || return 1
   [ "$(fm_pr_file_link_count "$path")" = 1 ]
+}
+
+fm_pr_private_dir_valid() {
+  local path=$1 device=$2 actual_mode
+  [ -d "$path" ] && [ ! -L "$path" ] || return 1
+  actual_mode=$(fm_pr_file_mode "$path") || return 1
+  fm_platform_mode_compatible 700 "$actual_mode" dir || return 1
+  [ "$(fm_pr_file_device "$path")" = "$device" ]
 }
 
 fm_pr_regular_destination_or_absent() {

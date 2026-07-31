@@ -1,0 +1,5 @@
+# FirstMate's executable entrypoints run under Git Bash on Windows. Keep their
+# shebangs and shell syntax LF-only even when core.autocrlf is enabled globally.
+*.sh text eol=lf
+bin/* text eol=lf
+tests/*.sh text eol=lf

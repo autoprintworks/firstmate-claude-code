@@ -96,6 +96,12 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 SECONDMATE_REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
+
+# Route every teardown Git operation through the native hidden-process bridge
+# on Windows. The bridge directly execs Git on other platforms.
+git() {
+  "$SCRIPT_DIR/fm-git" "$@"
+}
 # shellcheck source=bin/fm-tasks-axi-lib.sh
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-backend.sh
@@ -129,8 +135,16 @@ BACKEND=$FM_BACKEND_VALIDATED_BACKEND
 T=$FM_BACKEND_VALIDATED_TARGET
 WT=$(fm_meta_get "$META" worktree)
 PROJ=$(fm_meta_get "$META" project)
+CODEX_APP_THREAD_ID=$(fm_meta_get "$META" thread_id)
+CODEX_APP_THREAD_STATE=$(fm_meta_get "$META" codex_app_thread_state)
 T_ORCA=
 [ "$BACKEND" != orca ] || T_ORCA=$T
+if [ "$BACKEND" = codex-app ] && [ "$FORCE" != "--force" ] \
+   && [ "$CODEX_APP_THREAD_STATE" != archived ]; then
+  echo "REFUSED: Codex App thread ${CODEX_APP_THREAD_ID:-<unrecorded>} is not marked archived." >&2
+  echo "Use set_thread_archived(threadId=${CODEX_APP_THREAD_ID:-<thread-id>}, archived=true), then run: bin/fm-codex-app mark-archived $ID" >&2
+  exit 1
+fi
 "$FM_ROOT/bin/fm-guard.sh" || true
 HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
 PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
@@ -340,8 +354,7 @@ validate_pr_poll_cleanup() {
     echo "REFUSED: unsafe PR-check quarantine path $quarantine; preserving task state." >&2
     return 1
   fi
-  if [ "$(fm_pr_file_device "$quarantine")" != "$state_device" ] \
-    || [ "$(fm_pr_file_mode "$quarantine")" != 700 ]; then
+  if ! fm_pr_private_dir_valid "$quarantine" "$state_device"; then
     echo "REFUSED: PR-check quarantine is not on the task state device; preserving task state." >&2
     return 1
   fi
@@ -379,7 +392,7 @@ remove_pr_poll_artifacts() {
 pr_number_from_branch() {
   local branch=$1 out n
   [ -n "$branch" ] && [ "$branch" != HEAD ] || return 1
-  out=$( cd "$WT" && gh-axi pr list --state all --head "$branch" --limit 1 2>/dev/null ) || return 1
+  out=$( cd "$WT" && "$SCRIPT_DIR/fm-gh-axi" pr list --state all --head "$branch" --limit 1 2>/dev/null ) || return 1
   n=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*\([0-9][0-9]*\),.*/\1/p' | head -1)
   [ -n "$n" ] || return 1
   printf '%s' "$n"
@@ -456,7 +469,7 @@ pr_is_merged() {
     target=$(pr_number_from_branch "$branch") || return 1
   fi
   [ -n "$target" ] || return 1
-  view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
+  view=$(cd "$WT" && "$SCRIPT_DIR/fm-gh-axi" pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
   state=${view%%$'\t'*}
   head=${view#*$'\t'}
   [ "$state" != "$view" ] || return 1
@@ -1250,7 +1263,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   fi
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
-elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
+elif [ "$BACKEND" != codex-app ] && [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   if [ "$branch" != "HEAD" ]; then
     if git -C "$WT" checkout --detach -q 2>/dev/null; then
@@ -1347,7 +1360,7 @@ remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
-  "$STATE/$ID.kimi-turnend-token"
+  "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.codex-app.capture"
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi

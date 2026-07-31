@@ -178,13 +178,14 @@ test_help_includes_entire_header() {
 }
 
 # Registry with one project per delivery mode, so each ship-mode DOD branch is
-# exercised. A project absent from the registry defaults to no-mistakes.
+# exercised. A project absent from the registry defaults to direct-PR.
 write_registry() {
   local home=$1
   mkdir -p "$home/data"
   cat > "$home/data/projects.md" <<'EOF'
 - direct-proj [direct-PR] - fixture for direct-PR mode (added 2026-07-01)
 - local-proj [local-only] - fixture for local-only mode (added 2026-07-01)
+- no-mistakes-proj [no-mistakes] - fixture for no-mistakes mode (added 2026-07-01)
 EOF
 }
 
@@ -198,7 +199,7 @@ test_ship_modes_generate_clean_briefs() {
   home="$TMP_ROOT/ship-home"
   write_registry "$home"
 
-  for id_proj in "brief-nomistakes-a1:no-registry-proj" "brief-directpr-a2:direct-proj" "brief-localonly-a3:local-proj"; do
+  for id_proj in "brief-nomistakes-a1:no-mistakes-proj" "brief-directpr-a2:direct-proj" "brief-localonly-a3:local-proj"; do
     id=${id_proj%%:*}
     proj=${id_proj##*:}
     FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$proj" >/dev/null 2>&1; status=$?
@@ -242,9 +243,9 @@ test_faster_paths_use_configured_authority_without_stacked_review() {
 test_no_mistakes_dod_wording() {
   local home id brief
   home="$TMP_ROOT/wording-home"
-  mkdir -p "$home/data"
+  write_registry "$home"
   id="brief-wording-b1"
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" no-mistakes-proj >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_present "$brief" "brief was not scaffolded"
   assert_grep "no-mistakes itself provides for the mechanics" "$brief" \

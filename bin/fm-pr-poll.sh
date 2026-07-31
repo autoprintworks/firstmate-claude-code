@@ -9,6 +9,8 @@
 set -u
 LC_ALL=C
 export LC_ALL
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GH_AXI=${FM_GH_AXI_BRIDGE:-$SCRIPT_DIR/fm-gh-axi}
 
 if [ "$#" -eq 6 ] && [ "$1" = --validated ]; then
   provider=$2
@@ -62,7 +64,7 @@ case "$provider" in
       .|..|*[!A-Za-z0-9._-]*) exit 0 ;;
     esac
     [ "$url" = "https://github.com/$owner/$repo/pull/$number" ] || exit 0
-    state=$(gh pr view "$url" --json state -q .state 2>/dev/null) || exit 0
+    state=$("$GH_AXI" pr view "$url" --json state -q .state 2>/dev/null) || exit 0
     [ "$state" = MERGED ] && printf '%s\n' merged
     ;;
   gitlab)

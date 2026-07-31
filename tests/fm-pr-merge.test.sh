@@ -49,6 +49,13 @@ add_gh_mocks() {
   cat > "$case_dir/fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
+case "${1:-} ${2:-}" in
+  "pr view")
+    case " $* " in
+      *headRefOid*) printf '%s\n' "$FM_TEST_PR_HEAD" ; exit 0 ;;
+    esac
+    ;;
+esac
 exit 0
 SH
   cat > "$case_dir/fakebin/gh" <<SH
@@ -63,6 +70,7 @@ esac
 exit 0
 SH
   chmod +x "$case_dir/fakebin/gh-axi" "$case_dir/fakebin/gh"
+  export FM_TEST_PR_HEAD=$head
 }
 
 # gh-axi mock that fails the merge call but succeeds everything else, so a
@@ -89,6 +97,7 @@ run_pr_merge() {
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_TEST_GH_AXI_LOG="$case_dir/gh-axi.log" \
+  FM_GH_AXI_SHIM="$case_dir/fakebin/gh-axi" \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_MERGE" "$@"
   rc=$?

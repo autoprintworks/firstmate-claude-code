@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Windows-safe Git bridge entrypoint.
+# Usage: fm-git <git arguments...>
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+PYTHON_BIN="${PYTHON:-python}"
+
+if [ -n "${FM_GIT_SHIM:-}" ]; then
+  exec "$FM_GIT_SHIM" "$@"
+fi
+
+case "${_FM_UNAME:-$(uname 2>/dev/null || true)}" in
+  MINGW*|MSYS*|CYGWIN*) ;;
+  *) exec git "$@" ;;
+esac
+
+case "${PYTHONPATH:-}" in
+  "$FM_ROOT"|"$FM_ROOT":*) ;;
+  *) export PYTHONPATH="$FM_ROOT${PYTHONPATH:+:$PYTHONPATH}" ;;
+esac
+
+exec "$PYTHON_BIN" -m firstmate_gui_agnostic.git_hidden --cwd "$(pwd -P)" -- "$@"

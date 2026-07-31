@@ -41,7 +41,10 @@ You may maintain this repo's private operational state directly.
 Shared tracked material is `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, and public `skills/`.
 When any crewmate is live, delegate changes to shared tracked material rather than competing with supervision; when the fleet is empty, firstmate may change it directly.
 This repo is a shared template, while `.env`, `data/`, `state/`, `config/`, `projects/`, and `.no-mistakes/` are captain-private and gitignored.
-Ship shared tracked changes through this repo's no-mistakes pipeline and PR path, with the same merge authority as any other project.
+Ship shared tracked changes through this repo's direct-PR path.
+The captain runs the `code-review` skill against that PR and manually merges it after review.
+Use no-mistakes for this repo only when the captain explicitly selects it for commercially critical work.
+The same merge authority as any other project still applies.
 Never add an agent name as a commit co-author.
 
 ## 2. Layout and state
@@ -68,7 +71,7 @@ config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "de
 config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; firstmate-maintained but human-editable natural-language rules that choose a per-task harness/model/effort profile (section 4). Inherited by secondmate homes
 config/secondmate-harness  harness the PRIMARY uses to launch SECONDMATE agents, optionally followed by a model and effort token on the same line ("<harness> [<model>] [<effort>]"; section 4); LOCAL, gitignored; absent or "default" harness falls back to config/crew-harness then firstmate's own. The primary's own setting; NOT inherited into secondmate homes (secondmates do not spawn secondmates)
 config/backlog-backend  backlog backend override; LOCAL, gitignored; absent or "tasks-axi" = default tasks-axi backend, "manual" = force routine backlog updates to hand-editing; inherited by secondmate homes (section 10)
-config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend (docs/tmux-backend.md), while herdr, zellij, orca, and cmux are experimental spawn backends (docs/herdr-backend.md, docs/zellij-backend.md, docs/orca-backend.md, docs/cmux-backend.md) - herdr and cmux can also be selected by runtime auto-detection, zellij and orca never are (always explicit), and codex-app is not accepted; see docs/codex-app-backend.md; inherited by secondmate homes under the primary-authoritative contract in secondmate-provisioning
+config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend (docs/tmux-backend.md), herdr, zellij, orca, and cmux are experimental spawn backends (docs/herdr-backend.md, docs/zellij-backend.md, docs/orca-backend.md, docs/cmux-backend.md), and codex-app prepares visible Codex Desktop threads through host tools under docs/codex-app-backend.md; inherited by secondmate homes under the primary-authoritative contract in secondmate-provisioning
 config/calm     Pi Calm presentation preference; LOCAL, gitignored, and not inherited; see docs/configuration.md "Pi Calm preference"
 config/startup-memory-budget     primary-authoritative per-home startup-memory budget; LOCAL, gitignored, materialized as 7,500 estimated tokens by locked primary bootstrap and inherited into secondmate homes; see docs/configuration.md "Startup memory budget"
 config/herdr-presentation-spaces  optional presence flag for Herdr's default-off disposable single-task visual projection; LOCAL, gitignored; inherited by secondmate homes; see docs/herdr-backend.md "Optional presentation spaces"
@@ -264,6 +267,9 @@ Write the task-specific brief under section 11 before spawning.
 
 Spawn only through `bin/fm-spawn.sh` after the profile and backend checks in section 4.
 The spawn must resolve a genuine isolated task worktree distinct from the primary checkout; a failed isolation assertion stops the task.
+For `backend=codex-app`, load `firstmate-codexapp` and follow the host-assisted visible Codex Desktop threads protocol in `docs/codex-app-backend.md`.
+The shell prepares state first, then Codex Desktop uses `create_thread` or `fork_thread`, records the result with `bin/fm-codex-app record-thread`, and uses `send_message_to_thread` for steering.
+Use `bin/fm-codex-app adopt-thread` only to reconcile an existing visible thread, and call `set_thread_archived` before marking it archived and tearing it down.
 After spawning, confirm the worker is processing the brief, handle any trust dialog through `harness-adapters`, and record ship or scout work as under way.
 A persistent secondmate is recorded in the secondmate registry and runtime state, never as a backlog work item.
 
@@ -275,8 +281,10 @@ Supervise all live work under section 8.
 ### Selected delivery path and approval authority
 
 The selected delivery path owns its own rigor.
-When no-mistakes is selected, no-mistakes alone owns review, fixes, tests, documentation, push, PR, and CI; otherwise follow the faster path without adding an independent reviewer.
-Never hold work outside no-mistakes for a manual clean verdict, stack serial manual reviews, or infer authority for one from security, architecture, or risk alone.
+This firstmate repo defaults to direct-PR plus exactly one captain-run `code-review` pass before manual merge; no-mistakes is opt-in for commercially critical work.
+When no-mistakes is selected, no-mistakes alone owns review, fixes, tests, documentation, push, PR, and CI.
+Other projects on direct-PR follow the faster path without an independent reviewer unless the captain explicitly requests one.
+Do not stack serial manual reviews or infer authority for one from security, architecture, or risk alone.
 A separate review or audit is allowed only when the captain explicitly requests that deliverable or the authorized task is a knowledge-only review; one named question remains scoped to that question.
 If fast-path risk needs more rigor, escalate whether to use no-mistakes instead of inventing a manual gate.
 The path's worker, automated gates, and captain approval remain authoritative:

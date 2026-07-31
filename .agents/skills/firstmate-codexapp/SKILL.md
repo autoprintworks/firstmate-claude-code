@@ -1,7 +1,7 @@
 ---
 name: firstmate-codexapp
 description: >-
-  Agent-only playbook for coordinating visible Codex Desktop threads alongside Firstmate without pretending they are a selectable shell backend.
+  Agent-only playbook for coordinating the host-assisted Codex Desktop backend without pretending shell code owns the Desktop transport.
   Use before creating, reading, steering, archiving, debugging, or reviewing a Codex App visible thread for Firstmate work, and before responding to requests to make Codex App native to Firstmate.
 user-invocable: false
 metadata:
@@ -13,12 +13,13 @@ metadata:
 ## Overview
 
 Use this playbook when Firstmate work needs a visible Codex Desktop thread.
-The current supported shape is Desktop host-tool choreography plus an explicit status-file return-channel check, not a `codex-app` value in `FM_BACKEND`.
+The Windows-maintained build supports `FM_BACKEND=codex-app` through Desktop host-tool choreography plus an explicit status-file return-channel check.
 
 ## Boundary
 
-Codex Desktop visible threads are companion host-tool workflows, not a selectable Firstmate backend.
-Read `docs/codex-app-backend.md` when it exists in this checkout; that document owns the acceptance contract, bridge requirement, status-return requirement, and staged rollout.
+Codex Desktop visible threads are selectable through a host-assisted Firstmate backend.
+Read `docs/codex-app-backend.md`; that document owns the lifecycle, host boundary, status-return requirement, and teardown contract.
+The backend adapter may prepare and reconcile durable state, but it must never imitate a successful Desktop host operation from shell code.
 
 If local helper scripts exist for Codex App work, use only helpers explicitly provided by the operator or maintained by Firstmate.
 For helpers outside `bin/`, inspect the source or header before running `--help`.
@@ -31,8 +32,8 @@ For helpers outside `bin/`, inspect the source or header before running `--help`
    No host tool currently creates Codex App projects for an agent, so the human must add the project in Desktop before a created thread can reliably land there.
 3. Do not create projectless threads for repo work.
    If the project is absent, stop and ask for the project to be added or use a normal Firstmate backend instead.
-4. Decide whether this is a real Firstmate-managed task or a visible companion thread.
-   A real task needs a task id, an isolated worktree or Desktop-owned cwd, a branch plan, and a writable `state/<id>.status` path.
+4. Prepare a real Firstmate task with `fm-brief.sh` and `fm-spawn.sh --backend codex-app`, or decide explicitly that the thread is only a visible companion.
+   A managed task needs a task id, a Desktop-owned cwd, a branch plan, and a writable `state/<id>.status` path.
 
 ## Create And Send
 
@@ -99,7 +100,7 @@ Archive through the Desktop host tool: `archive` when that is the exposed primit
 Archiving can remove the thread from normal sidebar/project views, but it should not erase the transcript or landed work.
 
 For companion threads, archive the thread and report where the durable work landed.
-If there is a real Firstmate task record, leave teardown decisions to the normal Firstmate task flow instead of this skill.
+For a managed task, archive through the host, run `bin/fm-codex-app mark-archived <id>`, then leave cleanup to normal Firstmate teardown.
 
 ## Failure Signals
 
@@ -107,4 +108,4 @@ If there is a real Firstmate task record, leave teardown decisions to the normal
 - Missing host tools: do not simulate them with shell files; use a terminal backend instead.
 - Status file not updated: treat the thread as unsupervised until the return channel is proven.
 - Worker editing the saved project checkout instead of its Desktop cwd: stop and decide whether to salvage the branch before continuing.
-- Production `codex-app` backend request: read `docs/codex-app-backend.md` and do not invent a local adapter.
+- Shell helper claims a Desktop operation succeeded: stop and use the actual host tool before updating the ledger.

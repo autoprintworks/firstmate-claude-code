@@ -529,6 +529,20 @@ case "$ARG3" in
     ;;
 esac
 
+if [ "$BACKEND" = codex-app ]; then
+  [ "$KIND" != secondmate ] || {
+    echo "error: backend=codex-app does not support --secondmate spawns yet" >&2
+    exit 1
+  }
+  case "$ARG3" in
+    *' '*) echo "error: backend=codex-app does not support raw launch commands; use the codex harness" >&2; exit 1 ;;
+  esac
+  case "$HARNESS" in
+    codex*) ;;
+    *) echo "error: backend=codex-app supports only the codex harness (got '$HARNESS')" >&2; exit 1 ;;
+  esac
+fi
+
 case "$HARNESS" in
   pi|pi-signed) LAUNCH="FM_PI_HARNESS=$HARNESS $LAUNCH" ;;
 esac
@@ -1200,6 +1214,11 @@ EOF
     fi
     T="$ORCA_TERMINAL"
     ;;
+  codex-app)
+    T="$W"
+    WT="codex-app-pending-$ID"
+    CODEX_APP_PENDING_ACTION=create_thread_or_fork_thread
+    ;;
 esac
 # #134 robustness: only tmux needs a worktree-detection target distinct from $T -
 # its rename-safe stable window id, set as WT_TARGET=$WID in the tmux branch above.
@@ -1294,7 +1313,7 @@ kimi_spawn_fail() {  # <detail>
   echo "error: $1; inspect window $T" >&2
 }
 
-if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$BACKEND" != codex-app ]; then
   spawn_send_text_line "$WT_TARGET" 'treehouse get'
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
@@ -1349,7 +1368,10 @@ fi
 # Nested (not a bare /tmp/fm-<id>/gotmp) so other per-task temp can live alongside
 # later, and teardown cleans one deterministic path. GOTMPDIR (not TMPDIR) is the
 # targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
-TASK_TMP="/tmp/fm-$ID"
+case "$BACKEND" in
+  codex-app) TASK_TMP="$STATE/tmp/fm-$ID" ;;
+  *) TASK_TMP="/tmp/fm-$ID" ;;
+esac
 mkdir -p "$TASK_TMP/gotmp"
 
 # Per-harness turn-end hook where enabled: a file that touches
@@ -1366,7 +1388,7 @@ exclude_path() {
   mkdir -p "$(dirname "$EXCL")"
   grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
 }
-if [ "$KIND" != secondmate ]; then
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != codex-app ]; then
   # Arm the semantic busy-state contract (bin/fm-busy-lib.sh) for every
   # adapter with a verified semantic source. The launch brief sent below IS a
   # submitted turn, so the seed record is busy/fm-spawn. The minted gen is
@@ -1641,12 +1663,26 @@ META_WINDOW=$T
     echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
     echo "cmux_surface_id=$CMUX_SURFACE_ID"
   fi
+  if [ "$BACKEND" = codex-app ]; then
+    echo "codex_app_thread_state=pending"
+    echo "codex_app_pending_action=$CODEX_APP_PENDING_ACTION"
+    echo "codex_app_transport=visible-thread"
+    echo "codex_app_brief=$BRIEF_REAL"
+  fi
   if [ "$KIND" = secondmate ]; then
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
+
+if [ "$BACKEND" = codex-app ]; then
+  "$FM_ROOT/bin/fm-codex-app" prepare "$ID" "$W" "$BRIEF_REAL" >/dev/null
+  echo "prepared $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO backend=$BACKEND thread=$W"
+  echo "next: use Codex App create_thread or fork_thread for $W, send the brief at $BRIEF_REAL, then run:"
+  echo "      bin/fm-codex-app record-thread $ID <thread-id> [--worktree <path>] [--pending-worktree-id <id>]"
+  exit 0
+fi
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")

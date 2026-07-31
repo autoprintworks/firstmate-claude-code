@@ -12,6 +12,16 @@ set -u
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-check-lib.sh"
 
+fm_platform_mode_compatible 600 644 file MINGW64_NT || fail "shared Windows file-mode projection rejected 0600 -> 0644"
+fm_platform_mode_compatible 700 755 dir MSYS_NT || fail "shared Windows directory-mode projection rejected 0700 -> 0755"
+if fm_platform_mode_compatible 600 644 file Linux; then
+  fail "shared mode policy accepted a Windows projection on Linux"
+fi
+if fm_platform_mode_compatible 600 777 file MINGW64_NT; then
+  fail "shared mode policy accepted an unsupported projected mode"
+fi
+pass "shared projected-mode policy is platform-scoped and fail-closed"
+
 PR_CHECK="$ROOT/bin/fm-pr-check.sh"
 PR_MERGE="$ROOT/bin/fm-pr-merge.sh"
 MIGRATE="$ROOT/bin/fm-pr-check-migrate.sh"
@@ -35,6 +45,28 @@ file_mode() {
   fi
 }
 
+private_file_mode() {
+  local mode
+  mode=$(file_mode "$1")
+  [ "$mode" = 600 ] && return 0
+  case "$(uname 2>/dev/null || true):$mode" in
+    MINGW*:644|MINGW*:700|MINGW*:755|MSYS*:644|MSYS*:700|MSYS*:755|CYGWIN*:644|CYGWIN*:700|CYGWIN*:755) return 0 ;;
+  esac
+  return 1
+}
+
+is_windows_posix_layer() {
+  case "$(uname 2>/dev/null || true)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; esac
+  return 1
+}
+
+private_dir_mode() {
+  local mode
+  mode=$(file_mode "$1")
+  [ "$mode" = 700 ] && return 0
+  is_windows_posix_layer && [ "$mode" = 755 ]
+}
+
 state_snapshot() {
   local state=$1 file
   (
@@ -44,7 +76,7 @@ state_snapshot() {
         printf 'link %s %s\n' "$file" "$(readlink "$file")"
       else
         printf 'file %s %s ' "$file" "$(file_mode "$file")"
-        shasum -a 256 "$file" | awk '{print $1}'
+        fm_pr_sha256 "$file"
       fi
     done
   )
@@ -170,7 +202,7 @@ write_watcher_lock() {
 assert_valid_migration_marker() {
   local marker=$1
   [ -f "$marker" ] && [ ! -L "$marker" ] || fail "migration success did not publish an ordinary marker"
-  [ "$(file_mode "$marker")" = 600 ] || fail "migration marker mode was not 0600"
+  private_file_mode "$marker" || fail "migration marker mode was not private"
   grep -qxF fm-pr-check-migration-v1 "$marker" || fail "migration marker bytes were not exact"
   [ "$(awk 'END { print NR + 0 }' "$marker")" -eq 1 ] || fail "migration marker had extra records"
 }
@@ -178,7 +210,7 @@ assert_valid_migration_marker() {
 assert_valid_scan_marker() {
   local marker=$1
   [ -f "$marker" ] && [ ! -L "$marker" ] || fail "migration success did not publish an ordinary scan marker"
-  [ "$(file_mode "$marker")" = 600 ] || fail "migration scan marker mode was not 0600"
+  private_file_mode "$marker" || fail "migration scan marker mode was not private"
   grep -qxF fm-pr-check-migration-scan-v1 "$marker" || fail "migration scan marker bytes were not exact"
   [ "$(awk 'END { print NR + 0 }' "$marker")" -eq 1 ] || fail "migration scan marker had extra records"
 }
@@ -212,6 +244,28 @@ make_private_symlink() {
     *) fail "unknown symlink fixture kind" ;;
   esac
   ln -s "$LINK_TARGET" "$destination"
+}
+
+skip_if_symlink_unavailable() {
+  local path=$1
+  [ -L "$path" ] && return 1
+  if [ -d "$path" ]; then
+    rmdir "$path" 2>/dev/null || true
+  else
+    rm -f -- "$path"
+  fi
+  return 0
+}
+
+real_symlinks_available() {
+  local target="$TMP_ROOT/.symlink-probe-target" link="$TMP_ROOT/.symlink-probe-link" rc
+  rm -f -- "$target" "$link"
+  printf 'probe\n' > "$target"
+  ln -s "$target" "$link" 2>/dev/null
+  [ -L "$link" ]
+  rc=$?
+  rm -f -- "$link" "$target"
+  return "$rc"
 }
 
 assert_private_symlink_unchanged() {
@@ -343,6 +397,20 @@ INVALID_URLS=(
   'https://github.com/o/r/pull/1"'
 )
 
+# Git for Windows can normalize an ANSI-C quoted trailing carriage return out
+# of an in-process Bash array element. Drop only test vectors that have already
+# collapsed byte-for-byte to the canonical URL before the parser sees them.
+case "$(uname 2>/dev/null || true)" in
+  MINGW*|MSYS*|CYGWIN*)
+    _fm_invalid_urls_windows=()
+    for _fm_invalid_url in "${INVALID_URLS[@]}"; do
+      [ "$_fm_invalid_url" = https://github.com/o/r/pull/1 ] || _fm_invalid_urls_windows+=("$_fm_invalid_url")
+    done
+    INVALID_URLS=("${_fm_invalid_urls_windows[@]}")
+    unset _fm_invalid_url _fm_invalid_urls_windows
+    ;;
+esac
+
 # shellcheck disable=SC2016 # Literal shell syntax is task-ID test data.
 INVALID_IDS=(
   '../escape'
@@ -412,7 +480,7 @@ EOF
   [ "$FM_PR_HOST" = github.com ] || fail "parser returned wrong GitHub host"
   [ "$FM_PR_PATH" = a/b ] || fail "parser returned wrong GitHub project path"
   for row in "${INVALID_URLS[@]}"; do
-    ! fm_pr_url_parse "$row" || fail "parser accepted a rejected raw-byte URL class"
+    ! fm_pr_url_parse "$row" || fail "parser accepted a rejected raw-byte URL class: $(printf '%q' "$row")"
   done
   for id in -task task- task--a Task-a task_a task.a; do
     fm_pr_task_id_valid "$id" || fail "task ID validator rejected a safe lifecycle-compatible slug"
@@ -525,10 +593,10 @@ test_valid_recording_and_merge_derivation() {
     || fail "canonical pr metadata was not exact"
   grep -qxF "pr_head=$expected" "$dir/home/state/task-a.meta" || fail "PR head metadata was not exact"
   cmp -s "$POLL" "$dir/home/state/task-a.check.sh" || fail "published check was not byte-for-byte static"
-  [ "$(file_mode "$dir/home/state/task-a.check.sh")" = 600 ] || fail "published check mode was not 0600"
-  [ "$(file_mode "$dir/home/state/task-a.pr-poll")" = 600 ] || fail "published sidecar mode was not 0600"
-  [ "$(file_mode "$dir/home/state/task-a.pr-poll-registration")" = 600 ] \
-    || fail "published registration mode was not 0600"
+  private_file_mode "$dir/home/state/task-a.check.sh" || fail "published check mode was not private"
+  private_file_mode "$dir/home/state/task-a.pr-poll" || fail "published sidecar mode was not private"
+  private_file_mode "$dir/home/state/task-a.pr-poll-registration" \
+    || fail "published registration mode was not private"
   [ "$(fm_pr_file_link_count "$dir/home/state/task-a.check.sh")" = 1 ] \
     && [ "$(fm_pr_file_link_count "$dir/home/state/task-a.pr-poll")" = 1 ] \
     && [ "$(fm_pr_file_link_count "$dir/home/state/task-a.pr-poll-registration")" = 1 ] \
@@ -643,9 +711,13 @@ SH
 
 run_watcher_bounded() {
   local home=$1 fakebin=$2 check_interval=${FM_TEST_CHECK_INTERVAL:-0} watch_root=${FM_TEST_WATCH_ROOT:-$ROOT}
+  local watch_timeout=10
   shift 2
-  perl -e 'my $pid=fork; die unless defined $pid; if (!$pid) { exec @ARGV } local $SIG{ALRM}=sub { kill "TERM", $pid; waitpid $pid, 0; exit 124 }; alarm 10; waitpid $pid, 0; alarm 0; exit($? >> 8)' \
+  case "$(uname 2>/dev/null || true)" in MINGW*|MSYS*|CYGWIN*) watch_timeout=30 ;; esac
+  perl -e 'my $limit=shift @ARGV; my $pid=fork; die unless defined $pid; if (!$pid) { exec @ARGV } local $SIG{ALRM}=sub { kill "TERM", $pid; waitpid $pid, 0; exit 124 }; alarm $limit; waitpid $pid, 0; alarm 0; exit($? >> 8)' \
+    "$watch_timeout" \
     env FM_HOME="$home" FM_ROOT_OVERRIDE="$watch_root" FM_CHECK_INTERVAL="$check_interval" FM_CHECK_TIMEOUT=1 \
+      FM_GH_AXI_BRIDGE="${FM_GH_AXI_BRIDGE:-$fakebin/gh}" \
       FM_POLL=0.02 FM_HEARTBEAT=999999 FM_SIGNAL_GRACE=0 PATH="$fakebin:$BASE_PATH" "$WATCH" "$@"
 }
 
@@ -705,6 +777,7 @@ make_poll_fixture() {
 run_poll() {
   local dir=$1
   FM_TEST_GH_LOG="$dir/gh.log" FM_TEST_GLAB_LOG="$dir/glab.log" \
+    FM_GH_AXI_BRIDGE="$dir/fakebin/gh" \
     PATH="$dir/fakebin:$BASE_PATH" \
     bash "$dir/home/state/task-a.check.sh"
 }
@@ -823,9 +896,9 @@ SH
     [ ! -s "$dir/watch.err" ] || fail "concurrent watcher observed a partial artifact error"
     if [ -e "$dir/home/state/task-a.check.sh" ]; then
       cmp -s "$POLL" "$dir/home/state/task-a.check.sh" || fail "concurrent publication check bytes changed"
-      [ "$(file_mode "$dir/home/state/task-a.check.sh")" = 600 ] || fail "concurrent check mode was not private"
-      [ "$(file_mode "$dir/home/state/task-a.pr-poll")" = 600 ] || fail "concurrent sidecar mode was not private"
-      [ "$(file_mode "$dir/home/state/task-a.pr-poll-registration")" = 600 ] \
+      private_file_mode "$dir/home/state/task-a.check.sh" || fail "concurrent check mode was not private"
+      private_file_mode "$dir/home/state/task-a.pr-poll" || fail "concurrent sidecar mode was not private"
+      private_file_mode "$dir/home/state/task-a.pr-poll-registration" \
         || fail "concurrent registration mode was not private"
       fm_pr_poll_artifacts_valid "$dir/home/state" task-a "$POLL" \
         || fail "concurrent publication did not leave canonical provenance"
@@ -905,7 +978,7 @@ test_migration_initializes_fresh_state() {
 
   [ "$rc" -eq 0 ] || fail "fresh-state migration failed: $(cat "$dir/migrate.err")"
   [ -d "$state" ] && [ ! -L "$state" ] || fail "fresh-state migration did not create an ordinary state directory"
-  [ "$(file_mode "$state")" = 700 ] || fail "fresh-state migration did not create state with mode 0700"
+  private_dir_mode "$state" || fail "fresh-state migration did not create private state"
   assert_valid_migration_marker "$state/.pr-check-migration-v1"
   pass "migration creates and validates private state before watcher exclusion"
 }
@@ -920,6 +993,7 @@ test_private_artifact_paths_refuse_symlinks_and_directories() {
         || fail "could not stage poll symlink refusal fixture"
       destination="$state/$artifact"
       make_private_symlink "$dir" "$destination" "$kind"
+      skip_if_symlink_unavailable "$destination" && continue
       if fm_pr_poll_publish_prepared; then
         fail "poll publication accepted a private destination symlink"
       fi
@@ -961,6 +1035,7 @@ test_private_artifact_paths_refuse_symlinks_and_directories() {
           ;;
       esac
       make_private_symlink "$dir" "$destination" "$kind"
+      skip_if_symlink_unavailable "$destination" && continue
       set +e
       FM_HOME="$dir/home" PATH="$dir/fakebin:$BASE_PATH" "$MIGRATE" > "$dir/migrate.out" 2> "$dir/migrate.err"
       rc=$?
@@ -1036,9 +1111,10 @@ assert_no_final_poll() {
 }
 
 test_postrename_poll_validation_revokes_and_retries() {
-  local artifact action dir state destination link_target gate
+  local artifact action dir state destination link_target link_target_mode gate
   for artifact in data registration check; do
     for action in type mode device content; do
+      [ "$action" = mode ] && is_windows_posix_layer && continue
       dir=$(make_case "poll-final-$artifact-$action")
       state="$dir/home/state"
       write_poll_meta "$state" task-a https://github.com/o/r/pull/1
@@ -1057,6 +1133,7 @@ test_postrename_poll_validation_revokes_and_retries() {
       gate="$dir/device-fault"
       printf 'external sentinel\n' > "$link_target"
       chmod 0644 "$link_target"
+      link_target_mode=$(file_mode "$link_target")
       install_final_publication_fault "$dir"
       if FM_TEST_FINAL_PATH="$destination" FM_TEST_FINAL_ACTION="$action" \
         FM_TEST_FAULT_LINK_TARGET="$link_target" FM_TEST_FAULT_GATE="$gate" \
@@ -1067,7 +1144,7 @@ test_postrename_poll_validation_revokes_and_retries() {
       fm_pr_poll_cleanup
       assert_no_final_poll "$state"
       [ "$(cat "$link_target")" = 'external sentinel' ] || fail "poll type fault changed an external target"
-      [ "$(file_mode "$link_target")" = 644 ] || fail "poll type fault changed an external target mode"
+      [ "$(file_mode "$link_target")" = "$link_target_mode" ] || fail "poll type fault changed an external target mode"
 
       fm_pr_poll_prepare "$state" task-a github https://github.com/o/r/pull/2 github.com o/r 2 "$POLL" \
         || fail "could not prepare poll retry"
@@ -1149,9 +1226,10 @@ test_marker_and_diagnostic_rename_fail_closed() {
 }
 
 test_postrename_marker_and_diagnostic_validation_retries() {
-  local artifact action dir state destination link_target gate rc
+  local artifact action dir state destination link_target link_target_mode gate rc
   for artifact in marker diagnostic obligation; do
     for action in type mode device content; do
+      [ "$action" = mode ] && is_windows_posix_layer && continue
       dir=$(make_case "migration-final-$artifact-$action")
       state="$dir/home/state"
       case "$artifact" in
@@ -1171,6 +1249,7 @@ test_postrename_marker_and_diagnostic_validation_retries() {
       gate="$dir/device-fault"
       printf 'external sentinel\n' > "$link_target"
       chmod 0644 "$link_target"
+      link_target_mode=$(file_mode "$link_target")
       install_final_publication_fault "$dir"
       set +e
       FM_TEST_FINAL_PATH="$destination" FM_TEST_FINAL_ACTION="$action" \
@@ -1196,7 +1275,7 @@ test_postrename_marker_and_diagnostic_validation_retries() {
           || fail "post-rename obligation $action fault left an invalid obligation"
       fi
       [ "$(cat "$link_target")" = 'external sentinel' ] || fail "migration type fault changed an external target"
-      [ "$(file_mode "$link_target")" = 644 ] || fail "migration type fault changed an external target mode"
+      [ "$(file_mode "$link_target")" = "$link_target_mode" ] || fail "migration type fault changed an external target mode"
 
       FM_HOME="$dir/home" PATH="$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null \
         || fail "post-rename $artifact $action retry did not recover"
@@ -1226,42 +1305,44 @@ SH
 test_quarantine_validation_and_retry_contract() {
   local dir state rc quarantined external source_kind
 
-  dir=$(make_case quarantine-dir-mode-retry)
-  state="$dir/home/state"
-  write_ambiguous_poll "$dir"
-  mkdir "$state/.pr-check-quarantine"
-  chmod 0755 "$state/.pr-check-quarantine"
-  install_chmod_noop_fault "$dir"
-  set +e
-  FM_TEST_CHMOD_MATCH="$state/.pr-check-quarantine" FM_TEST_REAL_CHMOD="$REAL_CHMOD" \
-    FM_HOME="$dir/home" PATH="$dir/fakebin:$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null
-  rc=$?
-  set -e
-  [ "$rc" -ne 0 ] || fail "migration accepted a nonprivate quarantine directory"
-  [ ! -e "$state/.pr-check-migration-v1" ] || fail "quarantine directory mode fault published a marker"
-  FM_HOME="$dir/home" PATH="$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null \
-    || fail "quarantine directory mode fault did not recover on retry"
-  [ "$(file_mode "$state/.pr-check-quarantine")" = 700 ] || fail "retry did not repair quarantine directory mode"
-  assert_valid_migration_marker "$state/.pr-check-migration-v1"
+  if ! is_windows_posix_layer; then
+    dir=$(make_case quarantine-dir-mode-retry)
+    state="$dir/home/state"
+    write_ambiguous_poll "$dir"
+    mkdir "$state/.pr-check-quarantine"
+    chmod 0755 "$state/.pr-check-quarantine"
+    install_chmod_noop_fault "$dir"
+    set +e
+    FM_TEST_CHMOD_MATCH="$state/.pr-check-quarantine" FM_TEST_REAL_CHMOD="$REAL_CHMOD" \
+      FM_HOME="$dir/home" PATH="$dir/fakebin:$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "migration accepted a nonprivate quarantine directory"
+    [ ! -e "$state/.pr-check-migration-v1" ] || fail "quarantine directory mode fault published a marker"
+    FM_HOME="$dir/home" PATH="$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null \
+      || fail "quarantine directory mode fault did not recover on retry"
+    private_dir_mode "$state/.pr-check-quarantine" || fail "retry did not repair quarantine directory mode"
+    assert_valid_migration_marker "$state/.pr-check-migration-v1"
 
-  dir=$(make_case quarantine-artifact-mode-retry)
-  state="$dir/home/state"
-  write_ambiguous_poll "$dir"
-  chmod 0644 "$state/task-a.check.sh"
-  install_chmod_noop_fault "$dir"
-  set +e
-  FM_TEST_CHMOD_MATCH="$state/.pr-check-quarantine/task-a.check.*" FM_TEST_REAL_CHMOD="$REAL_CHMOD" \
-    FM_HOME="$dir/home" PATH="$dir/fakebin:$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null
-  rc=$?
-  set -e
-  [ "$rc" -ne 0 ] || fail "migration accepted a nonprivate quarantine artifact"
-  [ ! -e "$state/.pr-check-migration-v1" ] || fail "quarantine artifact mode fault published a marker"
-  FM_HOME="$dir/home" PATH="$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null \
-    || fail "quarantine artifact mode fault did not recover on retry"
-  quarantined=$(find "$state/.pr-check-quarantine" -name 'task-a.check.*' -type f | head -1)
-  [ -n "$quarantined" ] && [ "$(file_mode "$quarantined")" = 600 ] \
-    || fail "retry did not repair and validate the quarantine artifact"
-  assert_valid_migration_marker "$state/.pr-check-migration-v1"
+    dir=$(make_case quarantine-artifact-mode-retry)
+    state="$dir/home/state"
+    write_ambiguous_poll "$dir"
+    chmod 0644 "$state/task-a.check.sh"
+    install_chmod_noop_fault "$dir"
+    set +e
+    FM_TEST_CHMOD_MATCH="$state/.pr-check-quarantine/task-a.check.*" FM_TEST_REAL_CHMOD="$REAL_CHMOD" \
+      FM_HOME="$dir/home" PATH="$dir/fakebin:$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "migration accepted a nonprivate quarantine artifact"
+    [ ! -e "$state/.pr-check-migration-v1" ] || fail "quarantine artifact mode fault published a marker"
+    FM_HOME="$dir/home" PATH="$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null \
+      || fail "quarantine artifact mode fault did not recover on retry"
+    quarantined=$(find "$state/.pr-check-quarantine" -name 'task-a.check.*' -type f | head -1)
+    [ -n "$quarantined" ] && private_file_mode "$quarantined" \
+      || fail "retry did not repair and validate the quarantine artifact"
+    assert_valid_migration_marker "$state/.pr-check-migration-v1"
+  fi
 
   dir=$(make_case quarantine-artifact-device-retry)
   state="$dir/home/state"
@@ -1330,13 +1411,14 @@ SH
   [ ! -e "$state/task-a.check.sh" ] || fail "source-remains retry did not finish quarantine"
   assert_valid_migration_marker "$state/.pr-check-migration-v1"
 
-  dir=$(make_case quarantine-final-symlink)
-  state="$dir/home/state"
-  write_ambiguous_poll "$dir"
-  external="$dir/external-sentinel"
-  printf 'external sentinel\n' > "$external"
-  chmod 0644 "$external"
-  cat > "$dir/fakebin/mv" <<'SH'
+  if real_symlinks_available; then
+    dir=$(make_case quarantine-final-symlink)
+    state="$dir/home/state"
+    write_ambiguous_poll "$dir"
+    external="$dir/external-sentinel"
+    printf 'external sentinel\n' > "$external"
+    chmod 0644 "$external"
+    cat > "$dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
 last=${!#}
 "${FM_TEST_REAL_MV:?}" "$@" || exit $?
@@ -1347,24 +1429,26 @@ case "$last" in
     ;;
 esac
 SH
-  chmod +x "$dir/fakebin/mv"
-  set +e
-  FM_TEST_REAL_MV="$REAL_MV" FM_TEST_FAULT_LINK_TARGET="$external" \
-    FM_HOME="$dir/home" PATH="$dir/fakebin:$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null
-  rc=$?
-  set -e
-  [ "$rc" -ne 0 ] || fail "migration accepted a symlink as a final quarantine artifact"
-  [ ! -e "$state/.pr-check-migration-v1" ] || fail "quarantine symlink fault published a marker"
-  set +e
-  FM_HOME="$dir/home" PATH="$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null
-  rc=$?
-  set -e
-  [ "$rc" -ne 0 ] || fail "retry trusted a symlinked quarantine artifact"
-  [ ! -e "$state/.pr-check-migration-v1" ] || fail "quarantine symlink retry published a marker"
-  [ "$(cat "$external")" = 'external sentinel' ] || fail "quarantine symlink fault changed the external target"
-  [ "$(file_mode "$external")" = 644 ] || fail "quarantine symlink fault changed the external target mode"
+    chmod +x "$dir/fakebin/mv"
+    set +e
+    FM_TEST_REAL_MV="$REAL_MV" FM_TEST_FAULT_LINK_TARGET="$external" \
+      FM_HOME="$dir/home" PATH="$dir/fakebin:$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "migration accepted a symlink as a final quarantine artifact"
+    [ ! -e "$state/.pr-check-migration-v1" ] || fail "quarantine symlink fault published a marker"
+    set +e
+    FM_HOME="$dir/home" PATH="$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "retry trusted a symlinked quarantine artifact"
+    [ ! -e "$state/.pr-check-migration-v1" ] || fail "quarantine symlink retry published a marker"
+    [ "$(cat "$external")" = 'external sentinel' ] || fail "quarantine symlink fault changed the external target"
+    [ "$(file_mode "$external")" = 644 ] || fail "quarantine symlink fault changed the external target mode"
+  fi
 
   for source_kind in symlink fifo directory; do
+    [ "$source_kind" = symlink ] && ! real_symlinks_available && continue
     dir=$(make_case "quarantine-source-$source_kind")
     state="$dir/home/state"
     write_ambiguous_poll "$dir"
@@ -1654,25 +1738,27 @@ test_complete_single_link_validation() {
   fm_custom_check_snapshot_cleanup
   [ -e "$alias" ] || fail "custom-check hard-link refusal removed the external alias"
 
-  dir=$(make_case private-custom-check-source)
-  state="$dir/home/state"
-  printf '#!/usr/bin/env bash\nprintf "custom-ready\\n"\n' > "$state/custom.check.sh"
-  chmod 0755 "$state/custom.check.sh"
-  set +e
-  FM_HOME="$dir/home" "$REGISTER" custom > "$dir/register.out" 2> "$dir/register.err"
-  rc=$?
-  set -e
-  [ "$rc" -ne 0 ] || fail "custom check registration accepted a non-private source"
-  [ ! -e "$state/custom.check-trust" ] || fail "non-private custom check received a trust record"
-  chmod 0700 "$state/custom.check.sh"
-  FM_HOME="$dir/home" "$REGISTER" custom >/dev/null \
-    || fail "could not register private custom check fixture"
-  chmod 0755 "$state/custom.check.sh"
-  ! fm_custom_check_registered "$state" custom \
-    || fail "registered custom check remained authenticated after becoming non-private"
-  ! fm_custom_check_snapshot_prepare "$state" custom \
-    || fail "watcher snapshot accepted a non-private custom check source"
-  fm_custom_check_snapshot_cleanup
+  if ! is_windows_posix_layer; then
+    dir=$(make_case private-custom-check-source)
+    state="$dir/home/state"
+    printf '#!/usr/bin/env bash\nprintf "custom-ready\\n"\n' > "$state/custom.check.sh"
+    chmod 0755 "$state/custom.check.sh"
+    set +e
+    FM_HOME="$dir/home" "$REGISTER" custom > "$dir/register.out" 2> "$dir/register.err"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "custom check registration accepted a non-private source"
+    [ ! -e "$state/custom.check-trust" ] || fail "non-private custom check received a trust record"
+    chmod 0700 "$state/custom.check.sh"
+    FM_HOME="$dir/home" "$REGISTER" custom >/dev/null \
+      || fail "could not register private custom check fixture"
+    chmod 0755 "$state/custom.check.sh"
+    ! fm_custom_check_registered "$state" custom \
+      || fail "registered custom check remained authenticated after becoming non-private"
+    ! fm_custom_check_snapshot_prepare "$state" custom \
+      || fail "watcher snapshot accepted a non-private custom check source"
+    fm_custom_check_snapshot_cleanup
+  fi
 
   dir=$(make_case single-link-teardown-quarantine)
   state="$dir/home/state"
@@ -1781,7 +1867,7 @@ test_failed_outcomes_block_every_retry_until_repaired() {
 }
 
 test_canonical_publication_failure_recovers_only_on_retry() {
-  local dir state destination link_target gate rc pending success failure
+  local dir state destination link_target gate rc pending success failure fault_action=mode
   dir=$(make_case canonical-publication-retry)
   state="$dir/home/state"
   fm_write_meta "$state/task-a.meta" \
@@ -1796,9 +1882,10 @@ test_canonical_publication_failure_recovers_only_on_retry() {
   failure="$state/.pr-check-quarantine/task-a.diagnostic.failure-canonical"
   printf 'external sentinel\n' > "$link_target"
   install_final_publication_fault "$dir"
+  is_windows_posix_layer && fault_action=content
 
   set +e
-  FM_TEST_FINAL_PATH="$destination" FM_TEST_FINAL_ACTION=mode \
+  FM_TEST_FINAL_PATH="$destination" FM_TEST_FINAL_ACTION="$fault_action" \
     FM_TEST_FAULT_LINK_TARGET="$link_target" FM_TEST_FAULT_GATE="$gate" \
     FM_TEST_REAL_MV="$REAL_MV" FM_TEST_REAL_STAT="$REAL_STAT" FM_TEST_REAL_CHMOD="$REAL_CHMOD" \
     FM_HOME="$dir/home" PATH="$dir/fakebin:$BASE_PATH" "$MIGRATE" > "$dir/migrate-1.out" 2> "$dir/migrate-1.err"
@@ -2017,8 +2104,8 @@ test_nonexecuting_migration() {
     "canonical migration log mislabeled the rebuilt poll as unarmed"
   [ ! -e "$marker" ] || fail "migration executed legacy bytes"
   cmp -s "$POLL" "$state/task-a.check.sh" || fail "migration did not rebuild a canonical static poll"
-  [ "$(file_mode "$state/task-a.check.sh")" = 600 ] || fail "migrated check mode was not 0600"
-  [ "$(file_mode "$state/task-a.pr-poll")" = 600 ] || fail "migrated sidecar mode was not 0600"
+  private_file_mode "$state/task-a.check.sh" || fail "migrated check mode was not private"
+  private_file_mode "$state/task-a.pr-poll" || fail "migrated sidecar mode was not private"
   fm_pr_poll_artifacts_valid "$state" task-a "$POLL" || fail "canonical migration did not leave a validated armed poll"
   assert_valid_migration_marker "$state/.pr-check-migration-v1"
   find "$state/.pr-check-quarantine" -name 'task-a.check.*' -type f | grep . >/dev/null \
@@ -2076,7 +2163,7 @@ test_nonexecuting_migration() {
   [ ! -e "$state/task-b.pr-poll" ] || fail "ambiguous migration built a sidecar"
   find "$state/.pr-check-quarantine" -name 'task-b.check.*' -type f | grep . >/dev/null \
     || fail "ambiguous poll was not quarantined"
-  [ "$(file_mode "$state/.pr-check-migration.log")" = 600 ] || fail "migration diagnostics were not private"
+  private_file_mode "$state/.pr-check-migration.log" || fail "migration diagnostics were not private"
   assert_grep 'task task-b: ambiguous or invalid legacy poll quarantined and unarmed' "$state/.pr-check-migration.log" \
     "migration diagnostic did not record the quarantined unarmed outcome"
   assert_valid_migration_marker "$state/.pr-check-migration-v1"
@@ -2127,7 +2214,7 @@ SH
       || fail "$marker_kind historical X shim transition failed: $(cat "$dir/migrate.err")"
     fmx_poll_shim_valid "$shim" "$dir/home" "$dir/root" \
       || fail "$marker_kind historical X shim was not replaced with the current identity"
-    [ "$(file_mode "$shim")" = 700 ] || fail "$marker_kind current X shim mode was not 0700"
+    private_file_mode "$shim" || fail "$marker_kind current X shim mode was not private"
     [ ! -e "$executed" ] || fail "$marker_kind historical X shim was executed during migration"
     assert_valid_migration_marker "$state/.pr-check-migration-v1"
     assert_valid_scan_marker "$state/.pr-check-migration-scan-v1"
@@ -2156,10 +2243,12 @@ SH
   [ "$rc" -eq 0 ] || fail "standalone watcher did not complete the historical X transition"
   fmx_poll_shim_valid "$shim" "$dir/home" "$dir/root" \
     || fail "standalone watcher did not publish the current X identity"
-  [ "$(file_mode "$shim")" = 700 ] || fail "standalone watcher X shim mode was not 0700"
+  private_file_mode "$shim" || fail "standalone watcher X shim mode was not private"
   [ ! -e "$executed" ] || fail "standalone watcher executed the historical X shim"
 
   for variant in linked symlink byte-mismatch mode-0700 mode-0750 mode-0777; do
+    [ "$variant" = symlink ] && ! real_symlinks_available && continue
+    case "$variant" in mode-*) is_windows_posix_layer && continue ;; esac
     dir=$(make_case "historical-x-negative-$variant")
     state="$dir/home/state"
     shim="$state/x-watch.check.sh"
@@ -2257,7 +2346,7 @@ test_direct_registration_refreshes_v1_x_shim() {
       || fail "$marker_kind direct registration did not preserve the v1 X shim: $(cat "$dir/register.err")"
     fmx_poll_shim_valid "$shim" "$dir/home" "$dir/root" \
       || fail "$marker_kind direct registration did not refresh the v1 X shim identity"
-    [ "$(file_mode "$shim")" = 700 ] || fail "$marker_kind refreshed X shim was not private and executable"
+    private_file_mode "$shim" || fail "$marker_kind refreshed X shim was not private and executable"
     fm_pr_poll_artifacts_valid "$state" task-a "$POLL" \
       || fail "$marker_kind X shim refresh suppressed direct PR registration"
     assert_valid_migration_marker "$state/.pr-check-migration-v1"
@@ -2307,7 +2396,7 @@ test_bootstrap_migrates_before_other_mutations() {
     "$ROOT/bin/fm-bootstrap.sh" > "$dir/bootstrap.out" 2> "$dir/bootstrap.err" \
     || fail "bootstrap boundary failed"
   cmp -s "$POLL" "$state/task-a.check.sh" || fail "bootstrap did not migrate the legacy poll"
-  [ "$(file_mode "$state/task-a.check.sh")" = 600 ] || fail "bootstrap migration did not publish privately"
+  private_file_mode "$state/task-a.check.sh" || fail "bootstrap migration did not publish privately"
   pass "bootstrap runs the non-executing migration at the locked session boundary"
 }
 
@@ -2457,6 +2546,10 @@ SH
 
 test_custom_snapshot_cleanup_on_signal() {
   local dir state child_pid_file pid child_pid i rc
+  if is_windows_posix_layer; then
+    pass "skipped Unix process-group custom-check signal cleanup on Windows"
+    return
+  fi
   dir=$(make_case custom-snapshot-signal)
   state="$dir/home/state"
   child_pid_file="$dir/custom-child.pid"
@@ -2520,6 +2613,10 @@ SH
 
 test_returned_custom_check_descendants_are_drained() {
   local backend dir state fakebin ready direct_done child_pid_file sentinel watcher_pid child_pid i rc alive force_fallback
+  if is_windows_posix_layer; then
+    pass "skipped Unix process-group descendant draining on Windows"
+    return
+  fi
   for backend in installed-timeout fallback-timeout; do
     dir=$(make_case "returned-custom-descendant-$backend")
     state="$dir/home/state"
@@ -2738,6 +2835,7 @@ SH
   done
 
   for kind in regular dangling directory; do
+    ! real_symlinks_available && break
     dir=$(make_case "teardown-quarantine-link-$kind")
     fakebin="$dir/fakebin"
     fm_write_meta "$dir/home/state/task-a.meta" \
@@ -2927,7 +3025,7 @@ poll_artifact_snapshot() {
       printf 'link %s %s\n' "$suffix" "$(readlink "$path")"
     elif [ -f "$path" ]; then
       printf 'file %s %s ' "$suffix" "$(file_mode "$path")"
-      shasum -a 256 "$path" | awk '{print $1}'
+      fm_pr_sha256 "$path"
     else
       printf 'other %s\n' "$suffix"
     fi
@@ -2986,10 +3084,10 @@ test_persistent_secondmate_retirement_is_poll_only() {
   printf 'working: persistent endpoint remains healthy\n' > "$state/domain.status"
   printf -- '- domain | scope: test | home: %s\n' "$dir/secondmate-home" > "$dir/home/data/secondmates.md"
   printf 'endpoint-alive\n' > "$dir/endpoint-sentinel"
-  meta_before=$(shasum -a 256 "$state/domain.meta")
-  status_before=$(shasum -a 256 "$state/domain.status")
-  registry_before=$(shasum -a 256 "$dir/home/data/secondmates.md")
-  endpoint_before=$(shasum -a 256 "$dir/endpoint-sentinel")
+  meta_before=$(fm_pr_sha256 "$state/domain.meta")
+  status_before=$(fm_pr_sha256 "$state/domain.status")
+  registry_before=$(fm_pr_sha256 "$dir/home/data/secondmates.md")
+  endpoint_before=$(fm_pr_sha256 "$dir/endpoint-sentinel")
   seed_canonical_poll "$dir" domain https://github.com/o/r/pull/2
 
   set +e
@@ -2998,10 +3096,10 @@ test_persistent_secondmate_retirement_is_poll_only() {
   set -e
   [ "$rc" -eq 0 ] || fail "persistent secondmate merged watcher failed: $(cat "$dir/watch.err")"
   assert_poll_absent "$state" domain
-  [ "$(shasum -a 256 "$state/domain.meta")" = "$meta_before" ] || fail "retirement changed secondmate metadata"
-  [ "$(shasum -a 256 "$state/domain.status")" = "$status_before" ] || fail "retirement changed secondmate status"
-  [ "$(shasum -a 256 "$dir/home/data/secondmates.md")" = "$registry_before" ] || fail "retirement changed secondmate registry"
-  [ "$(shasum -a 256 "$dir/endpoint-sentinel")" = "$endpoint_before" ] || fail "retirement changed secondmate endpoint evidence"
+  [ "$(fm_pr_sha256 "$state/domain.meta")" = "$meta_before" ] || fail "retirement changed secondmate metadata"
+  [ "$(fm_pr_sha256 "$state/domain.status")" = "$status_before" ] || fail "retirement changed secondmate status"
+  [ "$(fm_pr_sha256 "$dir/home/data/secondmates.md")" = "$registry_before" ] || fail "retirement changed secondmate registry"
+  [ "$(fm_pr_sha256 "$dir/endpoint-sentinel")" = "$endpoint_before" ] || fail "retirement changed secondmate endpoint evidence"
   [ -d "$dir/secondmate-home" ] || fail "retirement removed the persistent secondmate home"
   pass "merged poll retirement preserves every persistent secondmate lifecycle artifact"
 }
@@ -3202,16 +3300,16 @@ test_retirement_refuses_replacement_and_nonterminal_results() {
   fm_pr_poll_retirement_publish "$state" task-a "$POLL" merged || fail "could not publish rearm-race receipt"
   write_poll_meta "$state" task-a https://github.com/o/r/pull/21
   seed_canonical_poll "$dir" task-a https://github.com/o/r/pull/21
-  replacement_check=$(shasum -a 256 "$state/task-a.check.sh")
-  replacement_data=$(shasum -a 256 "$state/task-a.pr-poll")
-  replacement_registration=$(shasum -a 256 "$state/task-a.pr-poll-registration")
-  replacement_meta=$(shasum -a 256 "$state/task-a.meta")
+  replacement_check=$(fm_pr_sha256 "$state/task-a.check.sh")
+  replacement_data=$(fm_pr_sha256 "$state/task-a.pr-poll")
+  replacement_registration=$(fm_pr_sha256 "$state/task-a.pr-poll-registration")
+  replacement_meta=$(fm_pr_sha256 "$state/task-a.meta")
   fm_pr_poll_retirement_recover_one "$state" task-a "$POLL" || fail "stale receipt did not yield to a canonical replacement"
   [ ! -e "$state/task-a.pr-poll-retirement" ] || fail "stale receipt survived canonical replacement recovery"
-  [ "$(shasum -a 256 "$state/task-a.check.sh")" = "$replacement_check" ] || fail "stale receipt changed replacement check"
-  [ "$(shasum -a 256 "$state/task-a.pr-poll")" = "$replacement_data" ] || fail "stale receipt changed replacement data"
-  [ "$(shasum -a 256 "$state/task-a.pr-poll-registration")" = "$replacement_registration" ] || fail "stale receipt changed replacement registration"
-  [ "$(shasum -a 256 "$state/task-a.meta")" = "$replacement_meta" ] || fail "stale receipt changed replacement metadata"
+  [ "$(fm_pr_sha256 "$state/task-a.check.sh")" = "$replacement_check" ] || fail "stale receipt changed replacement check"
+  [ "$(fm_pr_sha256 "$state/task-a.pr-poll")" = "$replacement_data" ] || fail "stale receipt changed replacement data"
+  [ "$(fm_pr_sha256 "$state/task-a.pr-poll-registration")" = "$replacement_registration" ] || fail "stale receipt changed replacement registration"
+  [ "$(fm_pr_sha256 "$state/task-a.meta")" = "$replacement_meta" ] || fail "stale receipt changed replacement metadata"
   fm_pr_poll_artifacts_valid "$state" task-a "$POLL" || fail "replacement poll lost canonical provenance"
 
   dir=$(make_case retirement-template-update-rearm-race)
@@ -3230,17 +3328,17 @@ test_retirement_refuses_replacement_and_nonterminal_results() {
     || fail "could not publish pre-update rearm receipt"
   write_poll_meta "$state" task-a https://github.com/o/r/pull/24
   seed_canonical_poll "$dir" task-a https://github.com/o/r/pull/24 "$current_poll"
-  replacement_check=$(shasum -a 256 "$state/task-a.check.sh")
-  replacement_data=$(shasum -a 256 "$state/task-a.pr-poll")
-  replacement_registration=$(shasum -a 256 "$state/task-a.pr-poll-registration")
-  replacement_meta=$(shasum -a 256 "$state/task-a.meta")
+  replacement_check=$(fm_pr_sha256 "$state/task-a.check.sh")
+  replacement_data=$(fm_pr_sha256 "$state/task-a.pr-poll")
+  replacement_registration=$(fm_pr_sha256 "$state/task-a.pr-poll-registration")
+  replacement_meta=$(fm_pr_sha256 "$state/task-a.meta")
   fm_pr_poll_retirement_recover_one "$state" task-a "$current_poll" \
     || fail "template update blocked stale receipt recovery"
   [ ! -e "$state/task-a.pr-poll-retirement" ] || fail "pre-update receipt survived canonical replacement recovery"
-  [ "$(shasum -a 256 "$state/task-a.check.sh")" = "$replacement_check" ] || fail "pre-update receipt changed replacement check"
-  [ "$(shasum -a 256 "$state/task-a.pr-poll")" = "$replacement_data" ] || fail "pre-update receipt changed replacement data"
-  [ "$(shasum -a 256 "$state/task-a.pr-poll-registration")" = "$replacement_registration" ] || fail "pre-update receipt changed replacement registration"
-  [ "$(shasum -a 256 "$state/task-a.meta")" = "$replacement_meta" ] || fail "pre-update receipt changed replacement metadata"
+  [ "$(fm_pr_sha256 "$state/task-a.check.sh")" = "$replacement_check" ] || fail "pre-update receipt changed replacement check"
+  [ "$(fm_pr_sha256 "$state/task-a.pr-poll")" = "$replacement_data" ] || fail "pre-update receipt changed replacement data"
+  [ "$(fm_pr_sha256 "$state/task-a.pr-poll-registration")" = "$replacement_registration" ] || fail "pre-update receipt changed replacement registration"
+  [ "$(fm_pr_sha256 "$state/task-a.meta")" = "$replacement_meta" ] || fail "pre-update receipt changed replacement metadata"
   fm_pr_poll_artifacts_valid "$state" task-a "$current_poll" || fail "updated replacement poll lost canonical provenance"
 
   dir=$(make_case custom-merged-not-retired)

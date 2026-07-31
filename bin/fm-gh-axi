@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Windows-safe gh-axi bridge entrypoint.
+# Usage: fm-gh-axi <gh-axi arguments...>
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+PYTHON_BIN="${PYTHON:-python}"
+
+if [ -n "${FM_GH_AXI_SHIM:-}" ]; then
+  exec "$FM_GH_AXI_SHIM" "$@"
+fi
+
+if [ -n "${FM_TEST_GH_AXI_LOG:-}" ] && command -v gh-axi >/dev/null 2>&1; then
+  exec gh-axi "$@"
+fi
+
+case "${PYTHONPATH:-}" in
+  "$FM_ROOT"|"$FM_ROOT":*) ;;
+  *) export PYTHONPATH="$FM_ROOT${PYTHONPATH:+:$PYTHONPATH}" ;;
+esac
+
+exec "$PYTHON_BIN" -m firstmate_gui_agnostic.gh_axi --cwd "$(pwd -P)" -- "$@"

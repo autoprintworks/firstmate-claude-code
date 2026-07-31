@@ -185,7 +185,10 @@ test_lock_single_winner_under_concurrency() {
         printf "%s\n" "$$" >> "$3"
         # Stay alive so the held lock names a live pid for the whole window;
         # otherwise a late contender could legitimately reclaim a dead-pid lock.
-        sleep 1
+        # Starting forty Git Bash processes takes longer on Windows than on
+        # Unix. Keep the winner alive until every contender has attempted the
+        # atomic directory lock.
+        sleep 5
       fi
     ' _ "$LIB" "$lockdir" "$marker" &
     pids="$pids $!"
@@ -235,7 +238,7 @@ test_lock_stale_steal_single_winner_under_concurrency() {
       . "$1"
       if fm_lock_try_acquire "$2"; then
         printf "%s\n" "${BASHPID:-$$}" >> "$3"
-        sleep 1
+        sleep 5
       fi
     ' _ "$LIB" "$lockdir" "$marker" &
     pids="$pids $!"
@@ -343,6 +346,12 @@ test_lock_late_claim_loses_after_recreate() {
   dir=$(make_case lock-late-claim)
   state="$dir/state"
   lockdir="$state/.contend.lock"
+  mkdir "$dir/symlink-target"
+  ln -s "$dir/symlink-target" "$dir/symlink-probe" 2>/dev/null || true
+  if [ ! -L "$dir/symlink-probe" ]; then
+    pass "late symlink-owner claim test skipped because this Windows shell cannot create symbolic links"
+    return 0
+  fi
   out=$(FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     owner1=$(fm_lock_owner_dir "$2") || exit 20
@@ -375,6 +384,12 @@ test_lock_paused_mid_acquire_claim_fails_during_steal() {
   dir=$(make_case lock-paused-claim-steal)
   state="$dir/state"
   lockdir="$state/.contend.lock"
+  mkdir "$dir/symlink-target"
+  ln -s "$dir/symlink-target" "$dir/symlink-probe" 2>/dev/null || true
+  if [ ! -L "$dir/symlink-probe" ]; then
+    pass "paused symlink-owner claim test skipped because this Windows shell cannot create symbolic links"
+    return 0
+  fi
   out=$(FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     owner=$(fm_lock_owner_dir "$2") || exit 20
@@ -438,7 +453,13 @@ test_watch_restart_rejects_reused_pid() {
 }
 
 test_watch_restart_attaches_to_healthy_peer() {
-  local dir state fakebin out peer identity armpid status i
+  local dir state fakebin out peer identity previous_identity armpid status i
+  case "$(uname 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*)
+      pass "TERM-resistant synthetic peer test skipped because MSYS does not preserve Unix signal-wrapper semantics"
+      return 0
+      ;;
+  esac
   dir=$(make_case restart-healthy-peer)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -446,7 +467,20 @@ test_watch_restart_attaches_to_healthy_peer() {
   mark_pr_check_migration_complete "$state"
   node -e 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 300000)' &
   peer=$!
-  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || fail "could not identify peer pid"
+  # On MSYS the process behind $! can transition from its launcher identity to
+  # node after the shell returns. Wait for two identical reads before seeding a
+  # watcher lock, matching the stable identity a real watcher publishes.
+  identity=
+  previous_identity=
+  i=0
+  while [ "$i" -lt 50 ]; do
+    identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer" 2>/dev/null || true)
+    [ -n "$identity" ] && [ "$identity" = "$previous_identity" ] && break
+    previous_identity=$identity
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -n "$identity" ] && [ "$identity" = "$previous_identity" ] || fail "could not identify peer pid stably"
   mkdir "$state/.watch.lock"
   printf '%s\n' "$peer" > "$state/.watch.lock/pid"
   printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
@@ -707,7 +741,8 @@ SH
   rc=0
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=0 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" || rc=$?
   [ "$rc" -eq 0 ] || fail "arm returned non-zero for an immediate wake (status $rc): $(cat "$armout")"
-  grep -F "check: $check_file: merged: https://example.test/pr/7" "$armout" >/dev/null || fail "arm did not propagate the immediate check wake"
+  grep -F "check: $check_file: merged: https://example.test/pr/7" "$armout" >/dev/null \
+    || fail "arm did not propagate the immediate check wake: $(cat "$armout")"
   ! grep -qF 'watcher: FAILED' "$armout" || fail "arm printed FAILED after a valid immediate wake"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" || fail "drain after immediate arm wake failed"
   grep "$(printf '\tcheck\t')" "$drain_out" | grep -F "$check_file" | grep -F 'merged: https://example.test/pr/7' >/dev/null || fail "immediate check wake was not queued"

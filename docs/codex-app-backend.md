@@ -1,57 +1,56 @@
-# Codex App backend boundary
+# Codex App backend
 
-Codex App is not a selectable Firstmate runtime backend.
-Codex Desktop host tools can create and supervise visible threads and those threads can write Firstmate status files when given an authorized path, but Firstmate has no supported shell-callable bridge to those host tools.
-A manual thread ledger is not a backend.
+The Windows-maintained build supports `codex-app` as a host-assisted runtime backend for visible Codex Desktop threads.
+It deliberately does not proxy Codex Desktop's private transport from shell code.
+Firstmate prepares and records durable task state, while the running Codex Desktop conversation performs thread operations with its host tools.
 
-## Acceptance contract
+## Requirements
 
-A future Codex App backend must satisfy the same lifecycle contract as terminal-backed adapters:
+- Run Firstmate from Codex Desktop on Windows with the thread tools available.
+- Save the target repository as a Codex Desktop project before dispatching work.
+- Select the backend with `FM_BACKEND=codex-app`, `config/backend`, or `fm-spawn.sh --backend codex-app`.
+- Use the `codex` harness.
+- Use ship or scout tasks only because secondmates are not supported by this backend yet.
 
-1. Create a task endpoint and return a durable thread id.
-2. Send the initial instructions and later operator messages to that endpoint.
-3. Read enough live state or bounded transcript to supervise the task.
-4. Archive, kill, or otherwise stop the exact endpoint.
-5. Let the thread append Firstmate's normal lifecycle lines to `state/<id>.status`.
+## Lifecycle
 
-The status return channel is mandatory.
-A visible thread that cannot report into Firstmate's normal lifecycle is not a complete backend.
+1. Run `bin/fm-brief.sh` normally.
+2. Run `bin/fm-spawn.sh <id> <project> codex --backend codex-app`.
+3. Firstmate writes pending task metadata and prints the brief path without launching a console process or calling `treehouse get`.
+4. Codex Desktop calls `create_thread` for the saved project, or `fork_thread` when the current conversation context must be retained.
+5. Record the returned identity with `bin/fm-codex-app record-thread <id> <thread-id> --worktree <thread-cwd>`.
+6. Use `read_thread` for live truth and cache bounded text with `bin/fm-codex-app record-capture` when shell-side `fm-peek.sh` needs it.
+7. Use `send_message_to_thread` to steer the worker.
+8. When work is landed or the scout report is complete, call `set_thread_archived`, then run `bin/fm-codex-app mark-archived <id>` before teardown.
 
-## Current blocker
+`bin/fm-codex-app adopt-thread` reconciles an already-visible thread into Firstmate state.
+The helper rejects duplicate thread ownership and malformed Windows drive paths.
 
-Firstmate backend scripts are shell entry points and can call tmux, Herdr, Zellij, Orca, and cmux directly.
-Codex Desktop host tools are available to a Desktop conversation, not to arbitrary Firstmate subprocesses.
-The missing component is a Codex Desktop-supported shell-callable transport, not another local ledger.
+## Supervision boundary
 
-`codex app-server --stdio` exposes useful JSON-RPC pieces such as thread start, turn start, thread read, and thread archive.
-A one-process probe could create and archive a thread record, but no supported bridge was found that lets Firstmate create, continue, read, and archive the same visible Desktop-owned endpoint over its full lifetime.
-A raw Desktop control-socket proxy is not a supported transport.
-These partial pieces do not authorize adding `codex-app` to the known or spawn-capable backend registries.
+The Desktop host owns thread creation, reading, steering, interruption, and archive operations.
+The shell adapter never claims those operations succeeded merely because it recorded a ledger entry.
+Shell-side send, interrupt, capture, and archive requests fail with the exact Desktop host action required.
 
-## Required bridge
+A managed thread must also write ordinary lifecycle lines to the authorized `state/<id>.status` path.
+Use only `working:`, `needs-decision:`, `blocked:`, `paused:`, `done:`, and `failed:` prefixes.
+If the thread cannot write that return channel, treat it as a visible companion thread rather than a completely supervised task.
 
-Implementation can begin after Codex Desktop exposes one supported interface:
+## Worktree and teardown safety
 
-- a CLI wrapper for create, send, read, and archive host-tool operations;
-- a documented JSON-RPC or MCP transport with stable framing; or
-- a maintained helper that speaks the supported transport and returns plain JSON to a shell adapter.
+Codex Desktop creates and owns the worker's isolated cwd.
+Never direct a worker to edit the saved project checkout.
+For ship tasks, record the Desktop worktree path and land its work before teardown.
+For scout tasks, the durable product remains `data/<id>/report.md` plus the required decision inventory.
 
-The bridge must provide these semantics:
+Teardown refuses an unarchived visible thread.
+After `mark-archived`, teardown clears Firstmate metadata and cached capture state without sending the Desktop-owned worktree through treehouse.
 
-```text
-create: task id, worktree request, initial instructions -> thread id, cwd, state
-send: thread id, text -> accepted or rejected
-read: thread id, bounded cursor -> transcript and live state
-archive: thread id -> archived or stopped
-return: thread appends state/<id>.status lifecycle lines
-```
+## Windows behavior
 
-Once available, Firstmate should add a real `bin/backends/codex-app.sh`, persist `backend=codex-app` and `codex_app_thread_id=`, and route spawn, send, peek, watch, and cleanup through the shared dispatcher.
+This backend prepares state and returns control to the Codex Desktop host instead of launching a child console.
+The maintained Windows Git and GitHub helpers use hidden no-shell subprocess settings, so routine integration does not open a black console window.
+Tracked shell entry points are forced to LF line endings so Git Bash can execute them after checkout.
 
-## Rollout
-
-Ship and scout tasks come first.
-Secondmate support remains out of scope until create, send, read, status return, and archive are proven through the normal backend dispatcher.
-Until then, Codex App remains a blocked backend boundary with a verified host-tool capability record, not a selectable backend.
-
-[`verification/runtime-backends.md`](verification/runtime-backends.md#codex-app-host-tools) owns the active Desktop host-tool smoke without exposing task-specific thread ids or local paths.
+`codex app-server` is a separate headless protocol and is not evidence that the visible Codex Desktop lifecycle works.
+The lifecycle tests must prove pending preparation, host thread recording, capture routing, steering refusal, archive enforcement, and cleanup.

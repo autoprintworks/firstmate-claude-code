@@ -141,6 +141,13 @@ fm_lock_prepare_owner() {
 
 fm_lock_link_owner() {
   local lockdir=$1 owner
+  # Windows Git Bash commonly runs without permission to create symbolic
+  # links. In that mode the atomically-created lock directory is its own
+  # owner. Keep the symlink owner model on platforms that support it.
+  if [ -d "$lockdir" ] && [ ! -L "$lockdir" ]; then
+    printf '%s\n' "$lockdir"
+    return 0
+  fi
   owner=$(readlink "$lockdir" 2>/dev/null) || return 1
   [ -n "$owner" ] || return 1
   case "$owner" in
@@ -151,6 +158,10 @@ fm_lock_link_owner() {
 
 fm_lock_points_to_owner() {
   local lockdir=$1 ownerdir=$2 actual
+  if [ -d "$lockdir" ] && [ ! -L "$lockdir" ]; then
+    [ "$lockdir" = "$ownerdir" ]
+    return
+  fi
   actual=$(readlink "$lockdir" 2>/dev/null) || return 1
   [ "$actual" = "$ownerdir" ]
 }
@@ -209,6 +220,22 @@ fm_lock_claim() {
 fm_lock_try_create() {
   local lockdir=$1 allowed_steal_owner=${2:-} ownerdir
   FM_LOCK_OWNER_DIR=
+  # mkdir is atomic and works without Windows Developer Mode or elevated
+  # symlink privileges. Prefer it so watcher and spawn locks work in a normal
+  # Git Bash installation. The existing owner-directory symlink path remains
+  # available when a directory claim loses a race.
+  if mkdir "$lockdir" 2>/dev/null; then
+    if fm_lock_prepare_owner "$lockdir"; then
+      if fm_lock_claim_blocked_by_steal "$lockdir" "$allowed_steal_owner"; then
+        fm_lock_discard_owner "$lockdir"
+        return 1
+      fi
+      FM_LOCK_OWNER_DIR=$lockdir
+      return 0
+    fi
+    fm_lock_discard_owner "$lockdir"
+    return 1
+  fi
   ownerdir=$(fm_lock_owner_dir "$lockdir") || return 1
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
     fm_lock_discard_owner "$ownerdir"

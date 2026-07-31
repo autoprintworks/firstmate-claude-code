@@ -96,9 +96,7 @@ private_migration_boundaries_valid() {
     fm_pr_private_file_valid "$LOG" 600 "$state_device" || return 1
   fi
   if [ -e "$QUARANTINE" ] || [ -L "$QUARANTINE" ]; then
-    [ -d "$QUARANTINE" ] && [ ! -L "$QUARANTINE" ] || return 1
-    [ "$(fm_pr_file_mode "$QUARANTINE")" = 700 ] || return 1
-    [ "$(fm_pr_file_device "$QUARANTINE")" = "$state_device" ] || return 1
+    fm_pr_private_dir_valid "$QUARANTINE" "$state_device" || return 1
     for artifact in "$QUARANTINE"/* "$QUARANTINE"/.[!.]* "$QUARANTINE"/..?*; do
       [ -e "$artifact" ] || [ -L "$artifact" ] || continue
       fm_pr_private_file_valid "$artifact" 600 "$state_device" || return 1
@@ -350,7 +348,6 @@ refresh_v1_x_shim() {
   mv -f -- "$MIGRATION_X_SHIM_TMP" "$shim" || return 1
   MIGRATION_X_SHIM_TMP=
   [ "$(fm_pr_file_device "$shim")" = "$STATE_DEVICE" ] || return 1
-  [ "$(fm_pr_file_mode "$shim")" = 700 ] || return 1
   fmx_poll_shim_valid "$shim" "$FM_HOME" "$FM_ROOT"
 }
 if ! refresh_v1_x_shim; then
@@ -460,9 +457,7 @@ publish_scan_marker() {
 }
 
 quarantine_dir_valid() {
-  [ -d "$QUARANTINE" ] && [ ! -L "$QUARANTINE" ] || return 1
-  [ "$(fm_pr_file_mode "$QUARANTINE")" = 700 ] || return 1
-  [ "$(fm_pr_file_device "$QUARANTINE")" = "$STATE_DEVICE" ]
+  fm_pr_private_dir_valid "$QUARANTINE" "$STATE_DEVICE"
 }
 
 ensure_quarantine_dir() {
@@ -482,13 +477,8 @@ quarantine_tree_repair_and_validate() {
   ensure_quarantine_dir || return 1
   for artifact in "$QUARANTINE"/* "$QUARANTINE"/.[!.]* "$QUARANTINE"/..?*; do
     [ -e "$artifact" ] || [ -L "$artifact" ] || continue
-    [ -f "$artifact" ] && [ ! -L "$artifact" ] || return 1
-    [ "$(fm_pr_file_device "$artifact")" = "$STATE_DEVICE" ] || return 1
-    [ "$(fm_pr_file_link_count "$artifact")" = 1 ] || return 1
     chmod 0600 "$artifact" || return 1
-    [ "$(fm_pr_file_mode "$artifact")" = 600 ] || return 1
-    [ "$(fm_pr_file_device "$artifact")" = "$STATE_DEVICE" ] || return 1
-    [ "$(fm_pr_file_link_count "$artifact")" = 1 ] || return 1
+    fm_pr_private_file_valid "$artifact" 600 "$STATE_DEVICE" || return 1
   done
   quarantine_dir_valid
 }
@@ -534,10 +524,7 @@ quarantine_artifact() {
   [ -f "$destination" ] && [ ! -L "$destination" ] || return 1
   [ "$(fm_pr_file_link_count "$destination")" = 1 ] || return 1
   chmod 0600 "$destination" || return 1
-  [ -f "$destination" ] && [ ! -L "$destination" ] || return 1
-  [ "$(fm_pr_file_mode "$destination")" = 600 ] || return 1
-  [ "$(fm_pr_file_device "$destination")" = "$STATE_DEVICE" ] || return 1
-  [ "$(fm_pr_file_link_count "$destination")" = 1 ] || return 1
+  fm_pr_private_file_valid "$destination" 600 "$STATE_DEVICE" || return 1
   [ ! -e "$source" ] && [ ! -L "$source" ]
 }
 

@@ -39,10 +39,29 @@ make_fake_toolchain() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
   fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/git"
   cat > "$fakebin/gh" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
+  [ "${FM_FAKE_GH_AUTH_STATUS:-0}" = 0 ] && exit 0
+  printf '%s\n' "${FM_FAKE_GH_AUTH_STATUS_ERROR:-auth status failed}" >&2
+  exit "${FM_FAKE_GH_AUTH_STATUS:-1}"
+fi
+if [ "${1:-}" = auth ] && [ "${2:-}" = token ]; then
+  [ -n "${FM_FAKE_GH_AUTH_TOKEN:-}" ] || exit 1
+  printf '%s\n' "$FM_FAKE_GH_AUTH_TOKEN"
   exit 0
+fi
+if [ "${1:-}" = api ] && [ "${2:-}" = user ]; then
+  case "${FM_FAKE_GH_API_RESULT:-ok}" in
+    ok) printf '%s\n' '{"login":"autoprintworks"}'; exit 0 ;;
+    network) printf '%s\n' 'Get "https://api.github.com/user": dial tcp 20.26.156.210:443: connectex: An attempt was made to access a socket in a way forbidden by its access permissions.' >&2; exit 1 ;;
+    bad) printf '%s\n' 'gh: Bad credentials (HTTP 401)' >&2; exit 1 ;;
+  esac
 fi
 exit 0
 SH
@@ -116,10 +135,15 @@ SH
 
 add_real_jq() {
   local fakebin=$1 real_jq
-  real_jq=$(command -v jq 2>/dev/null) || fail "jq is required for dispatch profile validation tests"
+  real_jq=$(command -v jq 2>/dev/null || true)
+  if [ -z "$real_jq" ] && [ -x "$ROOT/.tools/bin/jq.exe" ]; then
+    real_jq="$ROOT/.tools/bin/jq.exe"
+  fi
+  [ -n "$real_jq" ] || fail "jq is required for dispatch profile validation tests"
   cat > "$fakebin/jq" <<SH
 #!/usr/bin/env bash
-exec '$real_jq' "\$@"
+set -o pipefail
+'$real_jq' "\$@" | sed 's/\r$//'
 SH
   chmod +x "$fakebin/jq"
 }
@@ -163,12 +187,28 @@ add_no_origin_projects() {
 }
 
 run_bootstrap_timeout_case() {
-  local home=$1 fake_root=$2 fakebin=$3 override started_marker git_record wait_for_marker
+  local home=$1 fake_root=$2 fakebin=$3 override started_marker git_record wait_for_marker real_git
   override=__unset__
   started_marker=${5:-}
   git_record=${6:-}
   wait_for_marker=${7:-0}
   [ "$#" -lt 4 ] || override=$4
+  real_git=$(command -v git) || fail "real git is required for fleet timeout tests"
+  cat > "$fakebin/git" <<SH
+#!/usr/bin/env bash
+tries=0
+if [ "\${FM_FAKE_GIT_WAIT_FOR_FLEET_START:-}" = 1 ] && [ -n "\${FM_FAKE_FLEET_SYNC_STARTED_MARKER:-}" ]; then
+  while [ "\$tries" -lt 5 ] && [ ! -e "\$FM_FAKE_FLEET_SYNC_STARTED_MARKER" ]; do
+    sleep 0.01
+    tries=\$((tries + 1))
+  done
+fi
+if [ -n "\${FM_FAKE_GIT_SYNC_STARTED_RECORD:-}" ] && [ -n "\${FM_FAKE_FLEET_SYNC_STARTED_MARKER:-}" ] && [ -e "\$FM_FAKE_FLEET_SYNC_STARTED_MARKER" ]; then
+  printf '%s\n' "\$*" >> "\$FM_FAKE_GIT_SYNC_STARTED_RECORD"
+fi
+exec "$real_git" "\$@"
+SH
+  chmod +x "$fakebin/git"
   (
     # shellcheck disable=SC2317,SC2329 # Exported and invoked by the bootstrap subprocess.
     sleep() {
@@ -179,23 +219,7 @@ run_bootstrap_timeout_case() {
       # the simulated timeout kills it, even on a busy full-suite runner.
       command sleep 0.01
     }
-    # shellcheck disable=SC2317,SC2329 # Exported and invoked by the bootstrap subprocess.
-    git() {
-      local tries
-      if [ "${FM_FAKE_GIT_WAIT_FOR_FLEET_START:-}" = 1 ] && [ -n "${FM_FAKE_FLEET_SYNC_STARTED_MARKER:-}" ]; then
-        tries=0
-        while [ "$tries" -lt 5 ] && [ ! -e "$FM_FAKE_FLEET_SYNC_STARTED_MARKER" ]; do
-          command sleep 0.01
-          tries=$((tries + 1))
-        done
-      fi
-      if [ -n "${FM_FAKE_GIT_SYNC_STARTED_RECORD:-}" ] && [ -n "${FM_FAKE_FLEET_SYNC_STARTED_MARKER:-}" ] && [ -e "$FM_FAKE_FLEET_SYNC_STARTED_MARKER" ]; then
-        printf '%s\n' "$*" >> "$FM_FAKE_GIT_SYNC_STARTED_RECORD"
-      fi
-      command git "$@"
-    }
     export -f sleep
-    export -f git
     if [ "$override" = __unset__ ]; then
       PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$fake_root" \
         FM_FAKE_FLEET_SYNC_STARTED_MARKER="$started_marker" \
@@ -293,6 +317,33 @@ manual backlog backend still requires missing tasks-axi^1^-^1^manual^exact^MISSI
 manual backlog backend suppresses tasks-axi availability^1^0.1.1^1^manual^empty^^
 ROWS
   pass "bootstrap reports treehouse lease + tasks-axi/quota-axi bootstrap contracts"
+}
+
+test_gh_auth_network_fallback() {
+  local label token api mode case_dir fakebin out n
+  n=0
+  while IFS='^' read -r label token api mode; do
+    [ -n "$label" ] || continue
+    n=$((n + 1))
+    case_dir="$TMP_ROOT/gh-auth-$n"
+    mkdir -p "$case_dir/home/config"
+    printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+    fakebin=$(make_fake_toolchain "$case_dir")
+    out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+      FM_BACKEND=codex-app FM_FAKE_GH_AUTH_STATUS=1 FM_FAKE_GH_AUTH_TOKEN="$token" \
+      FM_FAKE_GH_API_RESULT="$api" "$ROOT/bin/fm-bootstrap.sh")
+    case "$mode" in
+      empty)
+        [ -z "$out" ] || fail "$label: expected silence, got: $out" ;;
+      needs)
+        [ "$out" = "NEEDS_GH_AUTH" ] || fail "$label: expected NEEDS_GH_AUTH, got: $out" ;;
+    esac
+  done <<'ROWS'
+token present with sandboxed network is accepted^gho_fake_token^network^empty
+missing token still needs auth^^network^needs
+bad credentials still needs auth^gho_fake_token^bad^needs
+ROWS
+  pass "bootstrap treats sandboxed gh network failure as token-present, not missing auth"
 }
 
 test_no_mistakes_min_version() {
@@ -516,7 +567,7 @@ test_unknown_backend_reports_invalid_configuration() {
   fakebin=$(make_fake_toolchain "$case_dir")
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_contains "$out" "BACKEND_INVALID: bogus (known: tmux herdr zellij orca cmux)" \
+  assert_contains "$out" "BACKEND_INVALID: bogus (known: tmux herdr zellij orca cmux codex-app)" \
     "bootstrap should report an unknown resolved backend"
   assert_not_contains "$out" "MISSING: tmux" "an unknown backend should not silently fall back to tmux dependencies"
   pass "bootstrap: unknown resolved backends fail closed with an actionable diagnostic"
@@ -682,7 +733,7 @@ test_fleet_sync_timeout_is_computed_before_launch() {
 }
 
 make_routine_bootstrap_fixture() {
-  local case_dir=$1 fakebin root home sm c1
+  local case_dir=$1 fakebin root home sm c1 real_git
   root="$case_dir/root"
   home="$case_dir/home"
   sm="$case_dir/sm"
@@ -714,6 +765,12 @@ make_routine_bootstrap_fixture() {
     printf 'home=%s\n' "$sm"
   } > "$home/state/sm.meta"
   fakebin=$(make_fake_toolchain "$case_dir")
+  real_git=$(command -v git) || fail "real git is required for routine bootstrap fixtures"
+  cat > "$fakebin/git" <<SH
+#!/usr/bin/env bash
+exec "$real_git" "\$@"
+SH
+  chmod +x "$fakebin/git"
   add_real_jq "$fakebin"
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
@@ -833,6 +890,7 @@ ROWS
 }
 
 test_bootstrap_reporting
+test_gh_auth_network_fallback
 test_no_mistakes_min_version
 test_quota_axi_min_version
 test_git_is_required_with_supported_install_instruction

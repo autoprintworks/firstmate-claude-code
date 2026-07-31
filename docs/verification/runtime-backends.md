@@ -450,8 +450,8 @@ The real smoke proves socket access, fresh readiness, current-path probing, send
 
 ## Codex App host tools
 
-A reusable Desktop host-tool smoke ran on 2026-07-06 against Codex Desktop bundle version 26.623.101652, build 4674, bundle id `com.openai.codex`.
-Local paths and task-specific ids are intentionally not retained here.
+A reusable Desktop host-tool smoke was reverified on 2026-07-31 against Codex Desktop package version 26.727.4816.0 on Windows.
+Local paths, account details, and task-specific ids are intentionally not retained here.
 
 The host-tool sequence was:
 
@@ -465,5 +465,6 @@ The host-tool sequence was:
 8. read the archived transcript with state `notLoaded`.
 
 Observed guarantee: a Desktop-owned thread can write Firstmate lifecycle files when the prompt provides an authorized absolute path, and create, send, read, and archive work at the Desktop host-tool layer.
-The missing guarantee remains a supported shell-callable bridge that lets Firstmate perform those operations against the same visible Desktop endpoint.
-App-server partial methods and raw socket experiments do not satisfy that bridge contract.
+The supported bridge is host-assisted: `bin/fm-codex-app` maintains the durable task-to-thread ledger and emits explicit host actions, while Codex Desktop performs thread creation, messaging, reading, interruption, and archival through its thread tools.
+`tests/fm-codex-app-state.test.sh`, `tests/fm-codex-app-e2e.test.sh`, and `tests/fm-doc-codex-app-protocol.test.sh` verify the shell side of that contract, including visible-thread state, adoption, recovery, and teardown handoff.
+Windows launches use hidden child-process integration, so the bridge does not require a transient console window.

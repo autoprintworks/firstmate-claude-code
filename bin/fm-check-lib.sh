@@ -53,15 +53,16 @@ fm_custom_check_snapshot_prepare() {
   state_device=$(fm_pr_file_device "$state") || return 1
   fm_pr_private_file_valid "$check" 700 "$state_device" || return 1
   FM_CUSTOM_CHECK_SNAPSHOT=$(mktemp "$state/.fm-custom-check.XXXXXX") || return 1
-  cp "$check" "$FM_CUSTOM_CHECK_SNAPSHOT" || { fm_custom_check_snapshot_cleanup; return 1; }
+  # MSYS cp can project the source executable bit onto an existing mktemp
+  # destination. Keep the private snapshot's original mode when supported.
+  cp --no-preserve=mode "$check" "$FM_CUSTOM_CHECK_SNAPSHOT" 2>/dev/null \
+    || cp "$check" "$FM_CUSTOM_CHECK_SNAPSHOT" \
+    || { fm_custom_check_snapshot_cleanup; return 1; }
   chmod 0600 "$FM_CUSTOM_CHECK_SNAPSHOT" || { fm_custom_check_snapshot_cleanup; return 1; }
   [ -f "$FM_CUSTOM_CHECK_SNAPSHOT" ] && [ ! -L "$FM_CUSTOM_CHECK_SNAPSHOT" ] \
     || { fm_custom_check_snapshot_cleanup; return 1; }
-  [ "$(fm_pr_file_mode "$FM_CUSTOM_CHECK_SNAPSHOT")" = 600 ] \
-    || { fm_custom_check_snapshot_cleanup; return 1; }
-  [ "$(fm_pr_file_device "$FM_CUSTOM_CHECK_SNAPSHOT")" = "$state_device" ] \
-    || { fm_custom_check_snapshot_cleanup; return 1; }
-  [ "$(fm_pr_file_link_count "$FM_CUSTOM_CHECK_SNAPSHOT")" = 1 ] \
+  # fm_pr_private_file_valid applies the shared NTFS projected-mode policy.
+  fm_pr_private_file_valid "$FM_CUSTOM_CHECK_SNAPSHOT" 600 "$state_device" \
     || { fm_custom_check_snapshot_cleanup; return 1; }
   hash=$(fm_custom_check_sha256 "$FM_CUSTOM_CHECK_SNAPSHOT") \
     || { fm_custom_check_snapshot_cleanup; return 1; }

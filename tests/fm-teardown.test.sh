@@ -38,17 +38,20 @@
 #   (o) fm-pr-check rerun after HEAD moved                      -> no stale pr_head
 #   (p) fm-pr-check when local HEAD lags                        -> record remote PR head
 #   (q) no-mistakes + NO pr= recorded, PR discovered by branch  -> ALLOW  (yolo/no-CI merge)
+#   (r) codex-app + dirty Desktop-owned worktree                -> REFUSE (safety)
+#   (s) codex-app + genuinely unlanded Desktop-owned worktree   -> REFUSE (safety)
+#   (t) codex-app + landed Desktop-owned worktree               -> ALLOW, keep worktree
 #
 # Also covers backlog teardown-lock-race: a git index.lock left in the worktree by a
 # killed crew process (bin/fm-teardown.sh's teardown_treehouse_return).
-#   (r) provably-stale index.lock (old mtime, no live holder) -> lock removed, ALLOW
-#   (s) index.lock with a live holder, any age                -> lock kept, REFUSE
-#   (t) lsof error while checking index.lock                  -> lock kept, REFUSE
-#   (u) dirty worktree after stale lock cleanup               -> lock removed, REFUSE
-#   (v) non-linked repo index.lock                            -> lock removed, ALLOW
-#   (w) index.lock mtime read failure                         -> lock kept, REFUSE
-#   (x) transient lock cleared after first failed return      -> retry ALLOW
-#   (y) persistent lock (never clears, not provably stale)    -> REFUSE loudly
+#   (u) provably-stale index.lock (old mtime, no live holder) -> lock removed, ALLOW
+#   (v) index.lock with a live holder, any age                -> lock kept, REFUSE
+#   (w) lsof error while checking index.lock                  -> lock kept, REFUSE
+#   (x) dirty worktree after stale lock cleanup               -> lock removed, REFUSE
+#   (y) non-linked repo index.lock                            -> lock removed, ALLOW
+#   (z) index.lock mtime read failure                         -> lock kept, REFUSE
+#   (aa) transient lock cleared after first failed return     -> retry ALLOW
+#   (ab) persistent lock (never clears, not provably stale)   -> REFUSE loudly
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -163,6 +166,23 @@ write_meta() {
     "mode=$mode"
 }
 
+# Replace the default tmux record with a fully adopted, already archived Codex
+# Desktop task. Desktop owns the physical worktree, so successful teardown may
+# clear FirstMate's ledger but must leave $case_dir/wt untouched.
+write_codex_app_meta() {
+  local case_dir=$1 mode=${2:-direct-PR} kind=${3:-ship}
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "backend=codex-app" \
+    "window=fm-task-x1" \
+    "endpoint_task_id=task-x1" \
+    "thread_id=thread-task-x1" \
+    "codex_app_thread_state=archived" \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    "kind=$kind" \
+    "mode=$mode"
+}
+
 # Commit something on the worktree's task branch. Args: case_dir [message]
 wt_commit() {
   local case_dir=$1 msg=${2:-wt work}
@@ -211,12 +231,17 @@ land_on_origin_main() {
 # Override GitHub lookups to report PR 7 as merged with the supplied head.
 add_gh_pr_merged_for_head() {
   local case_dir=$1 head=$2
-  cat > "$case_dir/fakebin/gh-axi" <<'SH'
+  cat > "$case_dir/fakebin/gh-axi" <<SH
 #!/usr/bin/env bash
-case "${1:-} ${2:-}" in
+case "\${1:-} \${2:-}" in
   "pr list")
     printf '%s\n' "count: 1 (showing first 1)" "pull_requests[1]{number,state}:" "  7,merged" ; exit 0 ;;
   "pr view")
+    case " \$* " in
+      *"state,headRefOid"*) printf '%s\t%s\n' 'MERGED' '$head' ; exit 0 ;;
+      *"headRefOid"*) printf '%s\n' '$head' ; exit 0 ;;
+      *"state"*) printf '%s\n' 'MERGED' ; exit 0 ;;
+    esac
     printf '%s\n' "pull_request:" "  number: 7" "  state: merged" '  merged: "2026-06-26T00:00:00Z"' ; exit 0 ;;
 esac
 exit 0
@@ -490,10 +515,13 @@ SH
 
 # Run teardown with PATH mocking. Args: case_dir [extra args...]
 run_teardown() {
-  local case_dir=$1; shift
+  local case_dir=$1 git_shim; shift
+  git_shim=$(PATH="$case_dir/fakebin:$PATH" command -v git)
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
+  FM_GH_AXI_SHIM="$case_dir/fakebin/gh-axi" \
+  FM_GIT_SHIM="$git_shim" \
   PATH="$case_dir/fakebin:$PATH" \
     "$TEARDOWN" task-x1 "$@"
 }
@@ -756,6 +784,7 @@ test_pr_check_does_not_refresh_stale_pr_head() {
 
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_GH_AXI_SHIM="$case_dir/fakebin/gh-axi" \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_CHECK" task-x1 https://github.com/example/repo/pull/7 >/dev/null
 
@@ -764,6 +793,7 @@ test_pr_check_does_not_refresh_stale_pr_head() {
 
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_GH_AXI_SHIM="$case_dir/fakebin/gh-axi" \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_CHECK" task-x1 https://github.com/example/repo/pull/7 >/dev/null
 
@@ -793,6 +823,7 @@ test_pr_check_records_remote_head_when_local_lags() {
 
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_GH_AXI_SHIM="$case_dir/fakebin/gh-axi" \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_CHECK" task-x1 https://github.com/example/repo/pull/7 >/dev/null
 
@@ -865,6 +896,79 @@ test_dirty_worktree_refuses() {
   grep -q REFUSED "$case_dir/stderr" || fail "dirty-wt: no REFUSED line in stderr"
   grep -q "uncommitted changes" "$case_dir/stderr" || fail "dirty-wt: refusal did not cite uncommitted changes"
   pass "dirty worktree is refused even when its committed work has landed (dirty always wins)"
+}
+
+test_codex_app_dirty_worktree_refuses() {
+  local case_dir rc
+  case_dir=$(make_case codex-app-dirty)
+  write_codex_app_meta "$case_dir"
+  git -C "$case_dir/wt" config core.autocrlf false
+  wt_commit_file "$case_dir" feature.txt landed "landed work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  printf '%s\n' dirty > "$case_dir/wt/feature.txt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "codex-app-dirty: teardown should refuse a dirty Desktop-owned worktree"
+  assert_grep "uncommitted changes" "$case_dir/stderr" \
+    "codex-app-dirty: refusal did not cite uncommitted changes"
+  [ -f "$case_dir/state/task-x1.meta" ] \
+    || fail "codex-app-dirty: teardown cleared task state after refusing dirty work"
+  [ -d "$case_dir/wt" ] || fail "codex-app-dirty: teardown removed the Desktop-owned worktree"
+  pass "codex-app teardown refuses dirty Desktop-owned ship work"
+}
+
+test_codex_app_unlanded_worktree_refuses() {
+  local case_dir rc
+  case_dir=$(make_case codex-app-unlanded)
+  write_codex_app_meta "$case_dir"
+  git -C "$case_dir/wt" config core.autocrlf false
+  wt_commit_file "$case_dir" feature.txt unlanded "unlanded work"
+  git -C "$case_dir/wt" status --porcelain >/dev/null \
+    || fail "codex-app-unlanded: fixture worktree is not inspectable"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "codex-app-unlanded: teardown should refuse unlanded Desktop-owned work"
+  if ! grep -q "not on any remote and not landed" "$case_dir/stderr"; then
+    cat "$case_dir/stderr" >&2
+    fail "codex-app-unlanded: refusal did not cite unlanded work"
+  fi
+  [ -f "$case_dir/state/task-x1.meta" ] \
+    || fail "codex-app-unlanded: teardown cleared task state after refusing unlanded work"
+  [ -d "$case_dir/wt" ] || fail "codex-app-unlanded: teardown removed the Desktop-owned worktree"
+  pass "codex-app teardown refuses unlanded Desktop-owned ship work"
+}
+
+test_codex_app_landed_worktree_allows_without_removal() {
+  local case_dir rc head_before
+  case_dir=$(make_case codex-app-landed)
+  write_codex_app_meta "$case_dir"
+  git -C "$case_dir/wt" config core.autocrlf false
+  wt_commit_file "$case_dir" feature.txt landed "landed work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  head_before=$(git -C "$case_dir/wt" rev-parse HEAD)
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "codex-app-landed: teardown should accept landed Desktop-owned work"
+  [ ! -e "$case_dir/state/task-x1.meta" ] \
+    || fail "codex-app-landed: teardown left task state behind"
+  [ -d "$case_dir/wt" ] || fail "codex-app-landed: teardown removed the Desktop-owned worktree"
+  [ "$(git -C "$case_dir/wt" rev-parse HEAD)" = "$head_before" ] \
+    || fail "codex-app-landed: teardown changed the Desktop-owned worktree HEAD"
+  pass "codex-app teardown clears landed task state without removing the Desktop-owned worktree"
 }
 
 test_gh_error_and_content_absent_refuses() {
@@ -1362,6 +1466,12 @@ SH
 
 test_herdr_projection_teardown_retires_journal_only_after_confirmed_close() {
   local case_dir log closed restored
+  case "$(uname 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*)
+      pass "Herdr projection teardown confirmation skipped because Herdr is not a Windows backend"
+      return 0
+      ;;
+  esac
   case_dir=$(make_case herdr-projection-confirmed-close)
   write_meta "$case_dir" local-only ship
   configure_herdr_projection_teardown_case "$case_dir"
@@ -1381,6 +1491,12 @@ test_herdr_projection_teardown_retires_journal_only_after_confirmed_close() {
 
 test_herdr_projection_teardown_retains_journal_when_close_unconfirmed() {
   local case_dir log closed restored
+  case "$(uname 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*)
+      pass "Herdr projection teardown refusal skipped because Herdr is not a Windows backend"
+      return 0
+      ;;
+  esac
   case_dir=$(make_case herdr-projection-unconfirmed-close)
   write_meta "$case_dir" local-only ship
   configure_herdr_projection_teardown_case "$case_dir"
@@ -1420,6 +1536,9 @@ test_pr_check_records_remote_head_when_local_lags
 test_content_in_default_fallback_allows
 test_content_fallback_refreshes_stale_origin_ref
 test_dirty_worktree_refuses
+test_codex_app_dirty_worktree_refuses
+test_codex_app_unlanded_worktree_refuses
+test_codex_app_landed_worktree_allows_without_removal
 test_gh_error_and_content_absent_refuses
 test_stale_index_lock_cleared_and_teardown_succeeds
 test_live_index_lock_is_never_removed_and_teardown_refuses
