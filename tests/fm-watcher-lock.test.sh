@@ -319,7 +319,11 @@ test_lock_late_claim_loses_after_recreate() {
   out=$(FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     owner1=$(fm_lock_owner_dir "$2") || exit 20
-    ln -s "$owner1" "$2" || exit 21
+    if command -v cygpath >/dev/null 2>&1; then
+      MSYS=winsymlinks:lnk ln -s "$owner1" "$2" || exit 21
+    else
+      ln -s "$owner1" "$2" || exit 21
+    fi
     touch -h -t 200001010000 "$2" 2>/dev/null || sleep 2
     if ! fm_lock_try_acquire "$2"; then exit 22; fi
     before=$(cat "$2/pid" 2>/dev/null || true)
@@ -351,7 +355,11 @@ test_lock_paused_mid_acquire_claim_fails_during_steal() {
   out=$(FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     owner=$(fm_lock_owner_dir "$2") || exit 20
-    ln -s "$owner" "$2" || exit 21
+    if command -v cygpath >/dev/null 2>&1; then
+      MSYS=winsymlinks:lnk ln -s "$owner" "$2" || exit 21
+    else
+      ln -s "$owner" "$2" || exit 21
+    fi
     fm_lock_try_acquire "$2.steal" || exit 22
     steal_owner=${FM_LOCK_OWNER_DIR:-}
     if fm_lock_claim "$2" "$owner"; then late=won; else late=lost; fi

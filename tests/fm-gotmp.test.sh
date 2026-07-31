@@ -24,6 +24,21 @@ pass() {
   printf 'ok - %s\n' "$1"
 }
 
+fm_ln_s() {
+  if command -v cygpath >/dev/null 2>&1; then
+    local target=$1 link=$2 link_win target_win
+    if [ -d "$target" ]; then
+      link_win=$(cygpath -w "$link")
+      target_win=$(cygpath -w "$target")
+      cmd //c mklink //J "$link_win" "$target_win" >/dev/null
+    else
+      MSYS=winsymlinks:lnk ln -s "$@"
+    fi
+  else
+    ln -s "$@"
+  fi
+}
+
 TMP_ROOT=
 
 cleanup() {
@@ -44,14 +59,14 @@ make_fake_root() {
   local fake="$TMP_ROOT/$id"
   mkdir -p "$fake/bin/backends" "$fake/state"
   # Symlink the REAL teardown so the test exercises actual code, not a copy.
-  ln -s "$TEARDOWN" "$fake/bin/fm-teardown.sh"
+  fm_ln_s "$TEARDOWN" "$fake/bin/fm-teardown.sh"
   # fm-backend.sh + its tmux adapter: symlink the REAL files (teardown sources
   # fm-backend.sh unconditionally, and dispatches the kill call through the
   # tmux adapter; both are unchanged by this suite's fixture, just newly
   # required siblings since the P1 backend extraction).
-  ln -s "$ROOT/bin/fm-backend.sh" "$fake/bin/fm-backend.sh"
-  ln -s "$ROOT/bin/backends/tmux.sh" "$fake/bin/backends/tmux.sh"
-  ln -s "$ROOT/bin/fm-tmux-lib.sh" "$fake/bin/fm-tmux-lib.sh"
+  fm_ln_s "$ROOT/bin/fm-backend.sh" "$fake/bin/fm-backend.sh"
+  fm_ln_s "$ROOT/bin/backends/tmux.sh" "$fake/bin/backends/tmux.sh"
+  fm_ln_s "$ROOT/bin/fm-tmux-lib.sh" "$fake/bin/fm-tmux-lib.sh"
   # fm-guard.sh: stub (teardown calls it with `|| true`).
   cat > "$fake/bin/fm-guard.sh" <<'SH'
 #!/usr/bin/env bash
@@ -142,10 +157,10 @@ test_teardown_skips_gracefully_without_tasktmp() {
   local id=td-absent-z3
   local fake="$TMP_ROOT/$id-root"
   mkdir -p "$fake/bin/backends" "$fake/state"
-  ln -s "$TEARDOWN" "$fake/bin/fm-teardown.sh"
-  ln -s "$ROOT/bin/fm-backend.sh" "$fake/bin/fm-backend.sh"
-  ln -s "$ROOT/bin/backends/tmux.sh" "$fake/bin/backends/tmux.sh"
-  ln -s "$ROOT/bin/fm-tmux-lib.sh" "$fake/bin/fm-tmux-lib.sh"
+  fm_ln_s "$TEARDOWN" "$fake/bin/fm-teardown.sh"
+  fm_ln_s "$ROOT/bin/fm-backend.sh" "$fake/bin/fm-backend.sh"
+  fm_ln_s "$ROOT/bin/backends/tmux.sh" "$fake/bin/backends/tmux.sh"
+  fm_ln_s "$ROOT/bin/fm-tmux-lib.sh" "$fake/bin/fm-tmux-lib.sh"
   cat > "$fake/bin/fm-guard.sh" <<'SH'
 #!/usr/bin/env bash
 exit 0

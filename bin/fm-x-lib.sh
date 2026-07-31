@@ -202,11 +202,10 @@ fmx_image_payload_file() {
     echo "$client: cannot read image file: $path" >&2
     return 1
   fi
-  jq -cn \
+  printf '%s' "$path" | jq -Rn \
     --arg media_type "$media_type" \
-    --arg source_path "$path" \
     --argjson bytes "$bytes" \
-    '{media_type:$media_type,bytes:$bytes,source_path:$source_path}'
+    '{media_type:$media_type,bytes:$bytes,source_path:input}'
 }
 
 fmx_reply_payload_json() {

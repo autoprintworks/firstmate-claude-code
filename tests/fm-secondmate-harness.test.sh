@@ -160,7 +160,7 @@ test_propagate_lib() {
   outside="$d/outside-target"
   rm -f "$dest/crew-harness" "$outside"
   printf 'outside\n' > "$outside"
-  ln -s "$outside" "$dest/crew-harness"
+  fm_ln_s "$outside" "$dest/crew-harness"
   printf 'pi\n' > "$src/crew-harness"
   propagate_inheritable_config "$src" "$dest"
   [ ! -L "$dest/crew-harness" ] || fail "destination symlink was not replaced"
@@ -175,7 +175,7 @@ test_propagate_lib() {
   [ -e "$dest/backlog-backend" ] && fail "backlog-backend absence not mirrored downstream"
 
   rm -f "$dest/crew-harness"
-  ln -s "$d/missing-target" "$dest/crew-harness"
+  fm_ln_s "$d/missing-target" "$dest/crew-harness"
   propagate_inheritable_config "$src" "$dest"
   [ -L "$dest/crew-harness" ] && fail "broken destination symlink not removed on absence mirror"
 

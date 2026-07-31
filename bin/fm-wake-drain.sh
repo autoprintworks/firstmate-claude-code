@@ -42,20 +42,60 @@ trap 'exit 143' TERM
 
 fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
 DRAIN_LOCK_HELD=true
+fm_lock_debug "drain acquired"
+
+if fm_wake_use_spool_backend; then
+  mkdir -p "$FM_WAKE_QUEUE_DIR"
+  if ! fm_wake_spool_has_entries; then
+    fm_wake_clear_pending
+    fm_lock_debug "drain empty-spool"
+    assert_watcher_liveness
+    fm_lock_debug "drain empty-spool-after-guard"
+    exit 0
+  fi
+
+  DRAIN_TMP="$STATE/.wake-queue.drain.$(fm_current_pid).${RANDOM:-0}"
+  rm -rf -- "$DRAIN_TMP" 2>/dev/null || true
+  fm_lock_debug "drain moving spool tmp=$DRAIN_TMP"
+  mv "$FM_WAKE_QUEUE_DIR" "$DRAIN_TMP" || exit 1
+  fm_lock_debug "drain moved spool tmp=$DRAIN_TMP"
+  mkdir -p "$FM_WAKE_QUEUE_DIR" || exit 1
+  fm_wake_clear_pending
+  fm_lock_debug "drain reset spool tmp=$DRAIN_TMP"
+
+  fm_wake_print_deduped_spool "$DRAIN_TMP" || exit "$?"
+  fm_lock_debug "drain printed spool tmp=$DRAIN_TMP"
+  rm -rf -- "$DRAIN_TMP"
+  DRAIN_TMP=
+  fm_lock_debug "drain removed spool tmp"
+  assert_watcher_liveness
+  fm_lock_debug "drain spool after guard"
+  fm_lock_debug "drain spool finished"
+  exit 0
+fi
 
 if [ ! -s "$FM_WAKE_QUEUE" ]; then
   : > "$FM_WAKE_QUEUE"
+  fm_lock_debug "drain empty-queue"
   assert_watcher_liveness
+  fm_lock_debug "drain empty-queue-after-guard"
   exit 0
 fi
 
 DRAIN_TMP="$STATE/.wake-queue.drain.$(fm_current_pid)"
 rm -f "$DRAIN_TMP"
+fm_lock_debug "drain moving queue tmp=$DRAIN_TMP"
 mv "$FM_WAKE_QUEUE" "$DRAIN_TMP" || exit 1
+fm_lock_debug "drain moved queue tmp=$DRAIN_TMP"
 : > "$FM_WAKE_QUEUE" || exit 1
+fm_lock_debug "drain reset queue tmp=$DRAIN_TMP"
 
 fm_wake_print_deduped "$DRAIN_TMP" || exit "$?"
+fm_lock_debug "drain printed tmp=$DRAIN_TMP"
 rm -f "$DRAIN_TMP"
 DRAIN_TMP=
+fm_lock_debug "drain removed tmp"
 assert_watcher_liveness
+fm_lock_debug "drain after guard"
+fm_lock_debug "drain finished"
 exit 0

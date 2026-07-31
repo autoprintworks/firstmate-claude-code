@@ -112,7 +112,7 @@ make_no_timeout_toolbin() {  # <dir> -> echoes toolbin path
   for tool in bash git grep sed head cut tail dirname perl; do
     real=$(command -v "$tool" || true)
     [ -n "$real" ] || fail "missing tool for no-timeout path: $tool"
-    ln -s "$real" "$tb/$tool"
+    fm_ln_s "$real" "$tb/$tool"
   done
   printf '%s\n' "$tb"
 }

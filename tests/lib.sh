@@ -30,6 +30,14 @@ FM_TEST_LIB_SOURCED=1
 # shellcheck disable=SC2034
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+if [ -f "$ROOT/bin/fm-git-lib.sh" ]; then
+  FM_ROOT="$ROOT"
+  FM_HOME="$ROOT"
+  # shellcheck source=bin/fm-git-lib.sh
+  . "$ROOT/bin/fm-git-lib.sh"
+  fm_git_prepare_runtime >/dev/null 2>&1 || true
+fi
+
 # --- reporters --------------------------------------------------------------
 
 fail() {
@@ -77,6 +85,21 @@ fm_fakebin() {
   local dir=$1 fakebin="$1/fakebin"
   mkdir -p "$fakebin"
   printf '%s\n' "$fakebin"
+}
+
+fm_ln_s() {
+  if command -v cygpath >/dev/null 2>&1; then
+    local target=$1 link=$2 link_win target_win
+    if [ -d "$target" ]; then
+      link_win=$(cygpath -w "$link")
+      target_win=$(cygpath -w "$target")
+      cmd //c mklink //J "$link_win" "$target_win" >/dev/null
+    else
+      MSYS=winsymlinks:lnk ln -s "$@"
+    fi
+  else
+    ln -s "$@"
+  fi
 }
 
 fm_fake_exit0() {

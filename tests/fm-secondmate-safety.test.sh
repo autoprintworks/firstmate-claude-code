@@ -667,6 +667,13 @@ test_home_seed_resolves_relative_source_origins() {
   printf '%s\n' "$out" | grep -F "home=$subhome_abs" >/dev/null || fail "seed did not report relative-origin subhome"
   [ -d "$subhome/projects/alpha/.git" ] || fail "relative source origin was not cloned"
   actual=$(git -C "$subhome/projects/alpha" remote get-url origin)
+  case "$actual" in
+    [A-Za-z]:/*|[A-Za-z]:\\*)
+      if command -v cygpath >/dev/null 2>&1; then
+        actual=$(cygpath -u "$actual")
+      fi
+      ;;
+  esac
   [ "$actual" = "$expected" ] || fail "relative source origin was not cloned through the resolved path"
   FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" design "$subhome" alpha >/dev/null \
     || fail "relative source origin did not compare equal on reseed"
@@ -748,7 +755,7 @@ test_home_seed_refuses_project_destinations_outside_subhome() {
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/symlink-alpha.git"
   git clone --quiet "$ROOT" "$subhome"
   rm -rf "$subhome/projects"
-  ln -s "$sink" "$subhome/projects"
+  fm_ln_s "$sink" "$subhome/projects"
   printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
   scaffold_secondmate_charter "$home" design 'design domain' alpha || fail "charter scaffold failed for symlink destination seed test"
 
@@ -779,7 +786,7 @@ test_home_seed_refuses_operational_dirs_outside_subhome() {
     git clone --quiet "$ROOT" "$subhome"
     mkdir -p "$sink"
     rm -rf "${subhome:?}/${opdir:?}"
-    ln -s "$sink" "$subhome/$opdir"
+    fm_ln_s "$sink" "$subhome/$opdir"
     if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" design "$subhome" alpha >/dev/null 2>"$err"; then
       fail "seed accepted a subhome with $opdir symlinked outside the subhome"
     fi
@@ -811,7 +818,7 @@ test_home_seed_refuses_symlinked_leaf_files() {
       expected=design
     fi
     printf '%s\n' "$expected" > "$sink"
-    ln -s "$sink" "$subhome/$leaf"
+    fm_ln_s "$sink" "$subhome/$leaf"
     if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" design "$subhome" alpha >/dev/null 2>"$err"; then
       fail "seed accepted symlinked leaf file $leaf"
     fi
@@ -949,7 +956,7 @@ test_secondmate_spawn_refuses_operational_dirs_outside_subhome() {
     printf 'domain\n' > "$subhome/.fm-secondmate-home"
     printf 'charter\n' > "$subhome/data/charter.md"
     rm -rf "${subhome:?}/${opdir:?}"
-    ln -s "$sink" "$subhome/$opdir"
+    fm_ln_s "$sink" "$subhome/$opdir"
     if [ "$opdir" = data ]; then
       printf 'charter\n' > "$sink/charter.md"
     fi
@@ -1161,7 +1168,7 @@ test_secondmate_force_teardown_allows_operational_dir_symlinks_inside_home() {
     rm -rf "$home" "$subhome"
     mkdir -p "$home/state" "$home/data" "$subhome" "$target"
     printf 'domain\n' > "$subhome/.fm-secondmate-home"
-    ln -s "$target" "$subhome/$opdir"
+    fm_ln_s "$target" "$subhome/$opdir"
     cat > "$home/state/domain.meta" <<EOF
 window=firstmate:fm-domain
 worktree=$subhome
@@ -1194,7 +1201,7 @@ test_secondmate_force_teardown_refuses_operational_dir_symlink_outside_home() {
   err="$TMP_ROOT/symlink-state-teardown.err"
   mkdir -p "$home/state" "$home/data" "$subhome" "$external_state"
   printf 'domain\n' > "$subhome/.fm-secondmate-home"
-  ln -s "$external_state" "$subhome/state"
+  fm_ln_s "$external_state" "$subhome/state"
   cat > "$home/state/domain.meta" <<EOF
 window=firstmate:fm-domain
 worktree=$subhome
@@ -1713,7 +1720,7 @@ EOF
   symlinkhome_abs=$(cd "$symlinkhome" && pwd -P)
   mkdir -p "$outside"
   rm -rf "$symlinkhome/data"
-  ln -s "$outside" "$symlinkhome/data"
+  fm_ln_s "$outside" "$symlinkhome/data"
   printf -- '- symlink-sm - bogus (home: %s; scope: bogus; projects: alpha; added 2026-06-22)\n' "$symlinkhome_abs" >> "$home/data/secondmates.md"
   cat > "$home/data/backlog.md" <<'EOF'
 ## Queued

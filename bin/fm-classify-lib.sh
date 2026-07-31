@@ -38,16 +38,23 @@ FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|
 
 # Return the last non-blank line of a status file (empty if missing/blank).
 last_status_line() {
-  local f=$1
+  local f=$1 line last=
   [ -e "$f" ] || return 0
-  grep -v '^[[:space:]]*$' "$f" 2>/dev/null | tail -1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      *[![:space:]]*) last=$line ;;
+    esac
+  done < "$f" 2>/dev/null || true
+  [ -z "$last" ] || printf '%s\n' "$last"
 }
 
 # 0 if the given (last) status line matches a captain-relevant verb.
 status_is_captain_relevant() {
-  local line=$1
+  local line=$1 lower regex
   [ -n "$line" ] || return 1
-  printf '%s' "$line" | grep -qiE "${FM_CAPTAIN_RE:-$FM_CLASSIFY_CAPTAIN_RE_DEFAULT}"
+  lower=${line,,}
+  regex=${FM_CAPTAIN_RE:-$FM_CLASSIFY_CAPTAIN_RE_DEFAULT}
+  [[ "$lower" =~ ${regex,,} ]]
 }
 
 # task id from a recorded window target, falling back to the tmux-shaped

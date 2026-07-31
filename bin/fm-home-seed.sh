@@ -33,6 +33,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
+# shellcheck source=bin/fm-git-lib.sh
+. "$SCRIPT_DIR/fm-git-lib.sh"
 
 usage() {
   echo "usage: fm-home-seed.sh <id> <home|-> <project>..." >&2
@@ -123,8 +125,47 @@ normalize_joined_path() {
   printf '%s\n' "$out"
 }
 
+normalize_native_path() {
+  local path=$1
+  case "$path" in
+    [A-Za-z]:/*|[A-Za-z]:\\*)
+      if command -v cygpath >/dev/null 2>&1; then
+        cygpath -u "$path"
+      else
+        printf '%s\n' "$path"
+      fi
+      ;;
+    *)
+      printf '%s\n' "$path"
+      ;;
+  esac
+}
+
+canonical_path_via_python() {
+  local path=$1 py input out
+  if command -v python3 >/dev/null 2>&1; then
+    py=python3
+  elif command -v python >/dev/null 2>&1; then
+    py=python
+  else
+    return 1
+  fi
+  input=$path
+  if command -v cygpath >/dev/null 2>&1; then
+    input=$(cygpath -m "$path" 2>/dev/null || printf '%s\n' "$path")
+  fi
+  out=$("$py" -c 'import os, sys; print(os.path.realpath(os.path.abspath(sys.argv[1])))' "$input" 2>/dev/null || true)
+  [ -n "$out" ] || return 1
+  normalize_native_path "$out"
+}
+
 canonical_path_for_check() {
-  local path=$1 probe tail prefix parent base
+  local path=$1 probe tail prefix parent base via_python
+  via_python=$(canonical_path_via_python "$path" || true)
+  if [ -n "$via_python" ]; then
+    printf '%s\n' "$via_python"
+    return
+  fi
   case "$path" in
     /*) probe=$path ;;
     *) probe="$(pwd -P)/$path" ;;
@@ -427,6 +468,12 @@ validate_project_destination() {
 normalize_origin_url() {
   local repo=$1 url=$2 prefix
   case "$url" in
+    [A-Za-z]:/*|[A-Za-z]:\\*)
+      normalize_native_path "$url"
+      return
+      ;;
+  esac
+  case "$url" in
     file://*|*://*)
       printf '%s\n' "$url"
       return
@@ -529,7 +576,7 @@ EOF
 }
 
 clone_project() {
-  local project=$1 home=$2 src dst url dst_url mode
+  local project=$1 home=$2 src dst url dst_url cloned_url mode
   src="$PROJECTS/$project"
   dst=$(validate_project_destination "$home" "$project") || return 1
   [ -d "$src" ] || { echo "error: project $project not found at $src" >&2; return 1; }
@@ -554,6 +601,10 @@ EOF
   fi
   url=$(source_origin_url "$project" "$mode" "$src") || return 1
   git clone --quiet "$url" "$dst"
+  cloned_url=$(git -C "$dst" remote get-url origin 2>/dev/null || true)
+  if [ -n "$cloned_url" ] && [ "$cloned_url" != "$url" ]; then
+    git -C "$dst" remote set-url origin "$url"
+  fi
 }
 
 validate_seed_project() {

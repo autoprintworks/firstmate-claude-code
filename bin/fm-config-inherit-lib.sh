@@ -30,6 +30,9 @@
 # environment only in tests. Items must not contain whitespace.
 FM_INHERITABLE_CONFIG="${FM_INHERITABLE_CONFIG:-crew-dispatch.json crew-harness backlog-backend}"
 
+# shellcheck source=bin/fm-git-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-git-lib.sh"
+
 copy_inheritable_file() {
   local src=$1 dest=$2 dest_parent tmp
   if [ -e "$dest" ] && [ ! -f "$dest" ] && [ ! -L "$dest" ]; then
@@ -55,7 +58,7 @@ copy_inheritable_file() {
 }
 
 destination_allows_inherited_item() {
-  local dest_config=$1 item=$2 dest_parent dest_name dest_parent_abs top dest_path rel_path
+  local dest_config=$1 item=$2 dest_parent dest_name dest_parent_abs top dest_path rel_path created_dest_dir=0
   dest_parent=${dest_config%/*}
   dest_name=${dest_config##*/}
   [ -n "$dest_parent" ] && [ "$dest_parent" != "$dest_config" ] || return 1
@@ -63,13 +66,43 @@ destination_allows_inherited_item() {
   if ! git -C "$dest_parent_abs" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     return 0
   fi
+  fm_git_trust_path "$dest_parent_abs"
   top=$(git -C "$dest_parent_abs" rev-parse --show-toplevel 2>/dev/null) || return 1
+  fm_git_trust_path "$top"
+  case "$top" in
+    [A-Za-z]:/*|[A-Za-z]:\\*)
+      if command -v cygpath >/dev/null 2>&1; then
+        top=$(cygpath -u "$top" 2>/dev/null || printf '%s\n' "$top")
+      fi
+      ;;
+  esac
   dest_path="$dest_parent_abs/$dest_name/$item"
   case "$dest_path" in
     "$top"/*) rel_path=${dest_path#"$top"/} ;;
     *) return 1 ;;
   esac
-  git -C "$top" check-ignore -q -- "$rel_path" 2>/dev/null
+  if git -C "$top" check-ignore -q -- "$rel_path" 2>/dev/null; then
+    return 0
+  fi
+  if [ -e "$dest_path" ] || [ -L "$dest_path" ]; then
+    return 1
+  fi
+  if [ ! -d "$dest_parent_abs/$dest_name" ]; then
+    mkdir -p "$dest_parent_abs/$dest_name" 2>/dev/null || return 1
+    created_dest_dir=1
+  fi
+  : > "$dest_path" 2>/dev/null || {
+    [ "$created_dest_dir" -eq 0 ] || rmdir "$dest_parent_abs/$dest_name" 2>/dev/null || true
+    return 1
+  }
+  if git -C "$top" check-ignore -q -- "$rel_path" 2>/dev/null; then
+    rm -f "$dest_path" 2>/dev/null || true
+    [ "$created_dest_dir" -eq 0 ] || rmdir "$dest_parent_abs/$dest_name" 2>/dev/null || true
+    return 0
+  fi
+  rm -f "$dest_path" 2>/dev/null || true
+  [ "$created_dest_dir" -eq 0 ] || rmdir "$dest_parent_abs/$dest_name" 2>/dev/null || true
+  return 1
 }
 
 # propagate_inheritable_config <src-config-dir> <dest-config-dir>

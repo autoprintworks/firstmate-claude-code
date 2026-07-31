@@ -30,27 +30,93 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 mkdir -p "$STATE"
 
+fm_watch_debug() {
+  [ -n "${FM_WATCH_DEBUG:-}" ] || return 0
+  printf '%s\t%s\n' \
+    "$(date +%s.%N 2>/dev/null || date +%s)" \
+    "$*" >> "${FM_WATCH_DEBUG_LOG:-$STATE/.watch-debug.log}"
+}
+
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
-# Shared wake classifier (captain-relevant verbs + signal/stale/heartbeat
-# predicates), the SAME library the away-mode daemon uses, so the triage policy
-# has one definition.
-# shellcheck source=bin/fm-classify-lib.sh
-. "$SCRIPT_DIR/fm-classify-lib.sh"
-# The DEFAULT EVENT SOURCE: this watcher's poll loop over the pull primitives
-# (capture, recorded windows, backend busy-state, and the BUSY_REGEX fallback)
-# synthesizes the signal/stale/check/heartbeat wake vocabulary for backends with
-# no native event push. tmux always reports unknown busy-state, preserving the
-# original regex path. herdr contributes native semantic busy-state through the
-# same poll loop until a future push subscription replaces this default source;
-# see bin/fm-backend.sh and docs/herdr-backend.md.
-# shellcheck source=bin/fm-backend.sh
-. "$SCRIPT_DIR/fm-backend.sh"
-
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
+WATCH_SIGNAL_FASTPATH_PY="$SCRIPT_DIR/fm-watch-signal-fastpath.py"
+WATCH_STALE_FASTPATH_PY="$SCRIPT_DIR/fm-watch-stale-fastpath.py"
 WATCHER_STALE_GRACE=${FM_WATCHER_STALE_GRACE:-${FM_GUARD_GRACE:-300}}
-if ! fm_lock_try_acquire "$WATCH_LOCK"; then
+
+run_signal_fastpath() {
+  fm_lock_directory_only_platform || return 2
+  command -v python >/dev/null 2>&1 || return 2
+  [ -f "$WATCH_SIGNAL_FASTPATH_PY" ] || return 2
+  python "$WATCH_SIGNAL_FASTPATH_PY"
+}
+
+run_stale_fastpath() {
+  fm_lock_directory_only_platform || return 2
+  command -v python >/dev/null 2>&1 || return 2
+  [ -f "$WATCH_STALE_FASTPATH_PY" ] || return 2
+  python "$WATCH_STALE_FASTPATH_PY"
+}
+
+state_has_meta() {
+  compgen -G "$STATE/*.meta" >/dev/null
+}
+
+watch_lock_try_acquire() {
+  local lockdir=$1 pid
+  if ! fm_lock_directory_only_platform; then
+    fm_lock_try_acquire "$lockdir"
+    return "$?"
+  fi
+
+  FM_LOCK_HELD_PID=
+  if mkdir "$lockdir" 2>/dev/null; then
+    printf '%s\n' "${BASHPID:-$$}" > "$lockdir/pid" 2>/dev/null || {
+      rm -f "$lockdir/pid" 2>/dev/null || true
+      rmdir "$lockdir" 2>/dev/null || true
+      return 1
+    }
+    return 0
+  fi
+
+  pid=$(fm_read_file_line "$lockdir/pid")
+  if fm_pid_alive "$pid"; then
+    FM_LOCK_HELD_PID=$pid
+    return 1
+  fi
+  if fm_lock_mid_acquire_is_fresh "$lockdir" "$pid"; then
+    FM_LOCK_HELD_PID=$pid
+    return 1
+  fi
+
+  rm -rf -- "$lockdir" 2>/dev/null || true
+  if mkdir "$lockdir" 2>/dev/null; then
+    printf '%s\n' "${BASHPID:-$$}" > "$lockdir/pid" 2>/dev/null || {
+      rm -f "$lockdir/pid" 2>/dev/null || true
+      rmdir "$lockdir" 2>/dev/null || true
+      return 1
+    }
+    return 0
+  fi
+
+  FM_LOCK_HELD_PID=$(fm_read_file_line "$lockdir/pid")
+  return 1
+}
+
+watch_lock_release() {
+  local lockdir=$1
+  if ! fm_lock_directory_only_platform; then
+    fm_lock_release "$lockdir"
+    return 0
+  fi
+  if [ "$(fm_read_file_line "$lockdir/pid")" != "${BASHPID:-$$}" ]; then
+    return 0
+  fi
+  rm -rf -- "$lockdir" 2>/dev/null || true
+}
+
+if ! watch_lock_try_acquire "$WATCH_LOCK"; then
   BEAT="$STATE/.last-watcher-beat"
   if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
     if [ -e "$BEAT" ]; then
@@ -69,14 +135,50 @@ if ! fm_lock_try_acquire "$WATCH_LOCK"; then
   fi
   exit 0
 fi
-trap 'fm_lock_release "$WATCH_LOCK"' EXIT
+watch_cleanup() {
+  fm_watch_debug "exit-trap-start"
+  watch_lock_release "$WATCH_LOCK"
+  fm_watch_debug "exit-trap-done"
+}
+trap watch_cleanup EXIT
+fm_watch_debug "lock-acquired pid=${BASHPID:-$$}"
 # This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
 # ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.
 WATCHER_PID=${BASHPID:-$$}
+if state_has_meta; then
+  if fastpath_reason=$(run_stale_fastpath 2>/dev/null); then
+    fm_watch_debug "startup-stale-fastpath actionable"
+    printf '%s\n' "$fastpath_reason"
+    exit 0
+  else
+    fastpath_rc=$?
+    case "$fastpath_rc" in
+      10) fm_watch_debug "startup-stale-fastpath pending=no" ;;
+      11) fm_watch_debug "startup-stale-fastpath absorbed" ;;
+    esac
+  fi
+fi
+if fastpath_reason=$(run_signal_fastpath 2>/dev/null); then
+  fm_watch_debug "startup-fastpath actionable"
+  printf '%s\n' "$fastpath_reason"
+  exit 0
+else
+  fastpath_rc=$?
+  case "$fastpath_rc" in
+    10) fm_watch_debug "startup-fastpath pending=no" ;;
+    11) fm_watch_debug "startup-fastpath absorbed" ;;
+  esac
+fi
+# Shared wake classifier (captain-relevant verbs + signal/stale/heartbeat
+# predicates), the SAME library the away-mode daemon uses, so the triage policy
+# has one definition.
+# shellcheck source=bin/fm-classify-lib.sh
+. "$SCRIPT_DIR/fm-classify-lib.sh"
 printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
+fm_watch_debug "identity-written pid=$WATCHER_PID"
 
 # Portable stat. macOS (BSD) stat uses `-f <fmt>`; Linux (GNU) stat uses `-c <fmt>`.
 # Do NOT use the `stat -f <fmt> ... || stat -c <fmt> ...` fallback form: on Linux
@@ -223,10 +325,11 @@ recorded_windows() {
 # (base * 2^streak, capped at HEARTBEAT_MAX); any real wake resets the cadence.
 wake() {
   case "$1" in
-    heartbeat*) echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak" ;;
+    heartbeat*) echo $(( $(fm_read_file_line "$STATE/.heartbeat-streak" || echo 0) + 1 )) > "$STATE/.heartbeat-streak" ;;
     *) echo 0 > "$STATE/.heartbeat-streak" ;;
   esac
   echo "$1"
+  fm_watch_debug "wake-exit reason=$1"
   exit 0
 }
 
@@ -236,10 +339,14 @@ wake() {
 age_of() {  # seconds since file mtime; "due immediately" if missing
   local f=$1 m
   m=$(stat_mtime "$f") || { echo 999999; return; }
-  echo $(( $(date +%s) - m ))
+  echo $(( $(fm_epoch_seconds) - m ))
 }
 
-[ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
+mark_time_file() {  # <file>
+  printf '%s\n' "$(fm_epoch_seconds)" > "$1"
+}
+
+[ -e "$STATE/.last-heartbeat" ] || mark_time_file "$STATE/.last-heartbeat"
 
 # Layer 2 + 3 signal scan: status files and turn-end markers. Each file is
 # compared against a persisted size:mtime signature (.seen-*) rather than
@@ -250,15 +357,82 @@ age_of() {  # seconds since file mtime; "due immediately" if missing
 # surfaced or intentionally absorbed, so a watcher killed mid-cycle never
 # swallows a signal.
 scan_signals() {
-  local f sig sf
+  local f sig sf base seen
   for f in "$STATE"/*.status "$STATE"/*.turn-ended; do
     [ -e "$f" ] || continue
     sig=$(stat_sig "$f") || continue
-    sf="$STATE/.seen-$(basename "$f" | tr '.' '_')"
-    if [ "$sig" != "$(cat "$sf" 2>/dev/null)" ]; then
-      printf '%s\t%s\t%s\n' "$sf" "$sig" "$f"
-    fi
+    base=${f##*/}
+    sf="$STATE/.seen-${base//./_}"
+    seen=$(fm_read_file_line "$sf")
+    [ "$sig" = "$seen" ] || printf '%s\t%s\t%s\n' "$sf" "$sig" "$f"
   done
+  return 0
+}
+
+process_pending_signals() {
+  local files reason pending_count i found f sf sig
+  files=""
+  pending_count=0
+  pending_sfs=()
+  pending_sigs=()
+  pending_files=()
+  while IFS=$(printf '\t') read -r sf sig f; do
+    [ -n "$sf" ] || continue
+    found=
+    i=0
+    while [ "$i" -lt "$pending_count" ]; do
+      if [ "${pending_files[$i]}" = "$f" ]; then
+        found=$i
+        break
+      fi
+      i=$((i + 1))
+    done
+    if [ -n "${found:-}" ]; then
+      pending_sfs[$found]=$sf
+      pending_sigs[$found]=$sig
+      continue
+    fi
+    pending_sfs[$pending_count]=$sf
+    pending_sigs[$pending_count]=$sig
+    pending_files[$pending_count]=$f
+    pending_count=$((pending_count + 1))
+    files="$files $f"
+  done <<EOF
+$pending
+EOF
+  [ "$pending_count" -gt 0 ] || return 1
+  reason="signal:$files"
+  # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
+  if afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
+    fm_watch_debug "signals-actionable files=$files"
+    i=0
+    while [ "$i" -lt "$pending_count" ]; do
+      f=${pending_files[$i]}
+      fm_wake_append signal "${f##*/}" "$reason" || exit 1
+      i=$((i + 1))
+    done
+    fm_watch_debug "signals-enqueued"
+    i=0
+    while [ "$i" -lt "$pending_count" ]; do
+      sf=${pending_sfs[$i]}
+      sig=${pending_sigs[$i]}
+      f=${pending_files[$i]}
+      printf '%s' "$sig" > "$sf"
+      mark_surfaced "$f"
+      i=$((i + 1))
+    done
+    fm_watch_debug "signals-marked"
+    wake "$reason"
+  else
+    i=0
+    while [ "$i" -lt "$pending_count" ]; do
+      sf=${pending_sfs[$i]}
+      sig=${pending_sigs[$i]}
+      printf '%s' "$sig" > "$sf"
+      i=$((i + 1))
+    done
+    triage_log "absorbed benign $reason"
+  fi
   return 0
 }
 
@@ -281,14 +455,21 @@ run_check() {
 # surface and absorb), .hb-surfaced is advanced ONLY on surface, so the heartbeat
 # fleet-scan can tell apart a captain-relevant status that already woke firstmate
 # from one that has not - the latter being a per-wake-path miss it must surface.
-_hb_surfaced_path() { printf '%s/.hb-surfaced-%s' "$STATE" "$(printf '%s' "$1" | tr ':/.' '___')"; }
+_hb_surfaced_path() {
+  local task=$1
+  task=${task//:/_}
+  task=${task//\//_}
+  task=${task//./_}
+  printf '%s/.hb-surfaced-%s' "$STATE" "$task"
+}
 
 # Record a status file's captain-relevant last line as surfaced (no-op for a
 # non-captain-relevant or empty status). Call AFTER the wake is enqueued, so the
 # enqueue-before-suppress ordering holds for this marker too.
 mark_surfaced() {  # <status-file>
   local f=$1 task last
-  task=$(basename "$f"); task="${task%.status}"
+  task=${f##*/}
+  task=${task%.status}
   last=$(last_status_line "$f")
   [ -n "$last" ] || return 0
   status_is_captain_relevant "$last" || return 0
@@ -326,6 +507,7 @@ heartbeat_scan_finds_actionable() {
 }
 
 while :; do
+  fm_watch_debug "loop-start pid=$WATCHER_PID"
   # Self-eviction: if the singleton lock no longer names this process, a second
   # watcher has taken over (e.g. a transient duplicate from a racy arm). Stand
   # down so the rightful singleton continues alone. The EXIT trap's release
@@ -338,7 +520,8 @@ while :; do
 
   # Liveness beacon for fm-guard.sh: a fresh mtime here means a watcher is
   # alive. Supervision scripts warn when this goes stale with tasks in flight.
-  touch "$STATE/.last-watcher-beat"
+  mark_time_file "$STATE/.last-watcher-beat"
+  fm_watch_debug "beat-touched"
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
@@ -354,11 +537,11 @@ while :; do
       if [ -n "$out" ]; then
         reason="check: $c: $out"
         fm_wake_append check "$c" "$reason" || exit 1
-        touch "$STATE/.last-check"
+        mark_time_file "$STATE/.last-check"
         wake "$reason"
       fi
     done
-    touch "$STATE/.last-check"
+    mark_time_file "$STATE/.last-check"
   fi
 
   # On the first changed signal, linger one grace period and re-scan before
@@ -366,55 +549,56 @@ while :; do
   # hook land seconds apart, and reporting them as separate actionable wakes
   # costs a full firstmate turn each. The re-scan also picks up a newer
   # signature for an already-pending file (last write wins below).
-  pending=$(scan_signals)
-  if [ -n "$pending" ]; then
-    sleep "$SIGNAL_GRACE"
-    pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
-    files=""
-    while IFS=$(printf '\t') read -r sf sig f; do
-      [ -n "$sf" ] || continue
-      case " $files " in *" $f "*) ;; *) files="$files $f" ;; esac
-    done <<EOF
-$pending
-EOF
-    reason="signal:$files"
-    # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
-    #   - the away-mode daemon owns triage (afk) and wants every wake;
-    #   - any status file carries a captain-relevant verb;
-    #   - or it is a no-verb wake (a bare turn-end, a working: note) whose crew is
-    #     NOT provably working - the crew stopped its turn with no actively-running
-    #     pipeline and no busy pane, so it may be done (even via an interactive menu
-    #     that wrote no done: status), waiting on a decision, or wedged. Absorbing
-    #     such a turn-end is exactly the swallowed-finish this change guards against.
-    # Actionable -> enqueue, advance .seen-* markers, exit. Benign (a no-verb wake
-    # whose crew IS provably working) in always-on mode -> advance the markers so it
-    # will not re-fire, log, and keep blocking without enqueuing. The provably-working
-    # check is the only costly one (it may run a bounded no-mistakes call), so the ||
-    # ordering evaluates it ONLY for a non-afk, no-captain-verb signal.
-    # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
-    if afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
-      while IFS=$(printf '\t') read -r sf sig f; do
-        [ -n "$sf" ] || continue
-        fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
-      done <<EOF
-$pending
-EOF
-      while IFS=$(printf '\t') read -r sf sig f; do
-        [ -n "$sf" ] || continue
-        printf '%s' "$sig" > "$sf"
-        mark_surfaced "$f"
-      done <<EOF
-$pending
-EOF
-      wake "$reason"
+  stale_fastpath_done=false
+  if state_has_meta; then
+    if fastpath_reason=$(run_stale_fastpath 2>/dev/null); then
+      fm_watch_debug "stale-fastpath actionable"
+      printf '%s\n' "$fastpath_reason"
+      exit 0
     else
-      while IFS=$(printf '\t') read -r sf sig f; do
-        [ -n "$sf" ] || continue
-        printf '%s' "$sig" > "$sf"
-      done <<EOF
-$pending
-EOF
-      triage_log "absorbed benign $reason"
+      fastpath_rc=$?
+      case "$fastpath_rc" in
+        10)
+          stale_fastpath_done=true
+          fm_watch_debug "stale-fastpath pending=no"
+          ;;
+        11)
+          stale_fastpath_done=true
+          fm_watch_debug "stale-fastpath absorbed"
+          ;;
+      esac
+    fi
+  fi
+  signal_fastpath_done=false
+  if fastpath_reason=$(run_signal_fastpath 2>/dev/null); then
+    fm_watch_debug "signals-fastpath actionable"
+    printf '%s\n' "$fastpath_reason"
+    exit 0
+  else
+    fastpath_rc=$?
+    case "$fastpath_rc" in
+      10)
+        signal_fastpath_done=true
+        fm_watch_debug "signals-fastpath pending=no"
+        ;;
+      11)
+        signal_fastpath_done=true
+        fm_watch_debug "signals-fastpath absorbed"
+        ;;
+    esac
+  fi
+  if [ "$signal_fastpath_done" = false ]; then
+    pending=$(scan_signals)
+    if [ -n "$pending" ]; then
+      fm_watch_debug "signals-scan pending=yes"
+    else
+      fm_watch_debug "signals-scan pending=no"
+    fi
+    if [ -n "$pending" ]; then
+      sleep "$SIGNAL_GRACE"
+      fm_watch_debug "signals-grace-complete"
+      pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
+      process_pending_signals
     fi
   fi
 
@@ -422,7 +606,19 @@ EOF
   # signature means the crewmate finished, is waiting, or is wedged. Each distinct
   # stale hash is surfaced, absorbed, or timed toward escalation once (.stale-*
   # remembers the hash already classified).
-  while IFS= read -r w; do
+  if [ "$stale_fastpath_done" = false ] && [ -z "${FM_WATCH_BACKEND_LOADED:-}" ]; then
+    # The DEFAULT EVENT SOURCE: this watcher's poll loop over the pull primitives
+    # (capture, recorded windows, backend busy-state, and the BUSY_REGEX fallback)
+    # synthesizes the signal/stale/check/heartbeat wake vocabulary for backends with
+    # no native event push. tmux always reports unknown busy-state, preserving the
+    # original regex path. herdr contributes native semantic busy-state through the
+    # same poll loop until a future push subscription replaces this default source;
+    # see bin/fm-backend.sh and docs/herdr-backend.md.
+    # shellcheck source=bin/fm-backend.sh
+    . "$SCRIPT_DIR/fm-backend.sh"
+    FM_WATCH_BACKEND_LOADED=1
+  fi
+  while [ "$stale_fastpath_done" = false ] && IFS= read -r w; do
     # A secondmate idling on its own watcher is healthy. Its parent supervises
     # it through status writes and heartbeats, not pane-idle staleness.
     [ "$(window_kind "$w")" = secondmate ] && continue
@@ -530,18 +726,18 @@ EOF
     # every heartbeat.
     if afk_present; then
       fm_wake_append heartbeat heartbeat heartbeat || exit 1
-      touch "$STATE/.last-heartbeat"
+      mark_time_file "$STATE/.last-heartbeat"
       wake "heartbeat"
     elif heartbeat_scan_finds_actionable; then
       # Backstop: a captain-relevant status the per-wake path absorbed by mistake.
       # Enqueue first, then mark every captain-relevant status surfaced so the next
       # heartbeat does not re-fire them (enqueue-before-suppress preserved).
       fm_wake_append heartbeat heartbeat heartbeat || exit 1
-      touch "$STATE/.last-heartbeat"
+      mark_time_file "$STATE/.last-heartbeat"
       mark_all_captain_relevant_surfaced
       wake "heartbeat"
     else
-      touch "$STATE/.last-heartbeat"
+      mark_time_file "$STATE/.last-heartbeat"
       echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak"
       triage_log "absorbed heartbeat (no captain-relevant change)"
     fi

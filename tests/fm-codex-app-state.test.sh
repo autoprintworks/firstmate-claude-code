@@ -7,6 +7,21 @@ mkdir -p "$TEST_TMP_ROOT"
 TMP=$(mktemp -d "$TEST_TMP_ROOT/fm-codex-app-state.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
+fm_ln_s() {
+  if command -v cygpath >/dev/null 2>&1; then
+    local target=$1 link=$2 link_win target_win
+    if [ -d "$target" ]; then
+      link_win=$(cygpath -w "$link")
+      target_win=$(cygpath -w "$target")
+      cmd //c mklink //J "$link_win" "$target_win" >/dev/null
+    else
+      MSYS=winsymlinks:lnk ln -s "$@"
+    fi
+  else
+    ln -s "$@"
+  fi
+}
+
 mkdir -p "$TMP/state"
 ID=state-test
 META="$TMP/state/$ID.meta"
@@ -113,7 +128,7 @@ grep -q 'already recorded' "$TMP/duplicate-thread.err"
 
 OPS="$TMP/ops"
 mkdir -p "$OPS/state" "$OPS/data" "$OPS/config"
-ln -s "$ROOT/bin" "$OPS/bin"
+fm_ln_s "$ROOT/bin" "$OPS/bin"
 SYMLINK_ID=symlink-root
 cat > "$OPS/state/$SYMLINK_ID.meta" <<EOF
 backend=codex-app
