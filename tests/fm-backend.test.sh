@@ -66,7 +66,13 @@ BASE_REF=$(resolve_base_ref) \
 # tmux-only conformance run the tmux adapter's behavior is what is under test,
 # and that is unchanged by any later (e.g. non-tmux backend) addition to
 # fm-backend.sh's own dispatch surface.
-OLD_BIN_UNCHANGED_SIBLINGS="fm-guard.sh fm-git-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-marker-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-tasks-axi-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-backend.sh"
+# fm-composer-lib.sh is listed because fm-tmux-lib.sh (itself an unchanged
+# sibling, symlinked in from $ROOT) sources it as a SIBLING of its own path. A
+# symlinked script's ${BASH_SOURCE[0]} is the LINK's path, so the lookup lands in
+# this fixture's bin/ rather than $ROOT/bin/ - omitting it makes every sourced
+# tmux path die under `set -e` with a bare "No such file", which surfaces here as
+# an inscrutable old-vs-new exit-code mismatch rather than a missing-file error.
+OLD_BIN_UNCHANGED_SIBLINGS="fm-guard.sh fm-git-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-marker-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-tasks-axi-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-backend.sh"
 OLD_BIN_REFACTORED="fm-send.sh fm-peek.sh fm-watch.sh fm-spawn.sh fm-teardown.sh"
 
 build_old_bin() {  # <name> -> echoes root dir (root/bin/<script> is the entry point)

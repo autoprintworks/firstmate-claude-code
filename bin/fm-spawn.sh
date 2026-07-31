@@ -596,32 +596,104 @@ EOF
     WT=""
     CODEX_APP_PENDING_ACTION=create_thread_or_fork_thread
     ;;
+  wezterm)
+    # Structurally the tmux path, with ONE contract difference: a tmux target is
+    # composed by the caller before creation ("session:window"), while a WezTerm
+    # pane id is ASSIGNED by the server at creation. So $T comes from
+    # create_task's stdout rather than from string concatenation. Everything
+    # downstream (send/capture/kill/resolve) already treats $T as opaque.
+    WEZTERM_WS=$(fm_backend_wezterm_container_ensure) || exit 1
+    T=$(fm_backend_wezterm_create_task "$WEZTERM_WS" "$W" "$PROJ_ABS") || exit 1
+    [ -n "$T" ] || { echo "error: wezterm create_task returned no pane id for $W" >&2; exit 1; }
+    ;;
+  claude-bg)
+    # Headless crewmates have no pane, so this arm only RESERVES the identity;
+    # the launch itself is deferred until after the worktree is leased and the
+    # turn-end hook is written (see the claude-bg launch block near the end of
+    # this script). Two reasons the usual order cannot hold:
+    #   1. There is no shell to run `treehouse get` in, so the worktree must be
+    #      acquired by this script before the agent exists.
+    #   2. `claude --bg` takes its first prompt AT LAUNCH, so there is no
+    #      "spawn, then send the brief" gap to send into.
+    [ "$KIND" != secondmate ] || { echo "error: FM_BACKEND=claude-bg does not support --secondmate; use tmux or wezterm for secondmates" >&2; exit 1; }
+    case "$ARG3" in
+      *' '*) echo "error: FM_BACKEND=claude-bg does not support raw launch commands; use the claude harness" >&2; exit 1 ;;
+    esac
+    case "$HARNESS" in
+      claude*) ;;
+      *) echo "error: FM_BACKEND=claude-bg supports only the claude harness (got '$HARNESS')" >&2; exit 1 ;;
+    esac
+    # The session id is CHOSEN here rather than parsed back after launch, so a
+    # crash between launch and meta-write cannot orphan an unfindable crewmate.
+    CLAUDE_BG_PY=$(fm_composer_python)
+    [ -n "$CLAUDE_BG_PY" ] || { echo "error: claude-bg needs a working python to mint a session id" >&2; exit 1; }
+    T=$("$CLAUDE_BG_PY" -c 'import uuid; print(uuid.uuid4())') || exit 1
+    [ -n "$T" ] || { echo "error: could not mint a claude-bg session id" >&2; exit 1; }
+    CLAUDE_BG_PENDING=1
+    ;;
 esac
 spawn_send_text_line() {  # <target> <text>
   case "$BACKEND" in
     tmux) fm_backend_tmux_send_text_line "$1" "$2" ;;
     herdr) fm_backend_herdr_send_text_line "$1" "$2" ;;
+    wezterm) fm_backend_wezterm_send_text_line "$1" "$2" ;;
   esac
 }
 spawn_current_path() {  # <target>
   case "$BACKEND" in
     tmux) fm_backend_tmux_current_path "$1" ;;
     herdr) fm_backend_herdr_current_path "$1" ;;
+    wezterm) fm_backend_wezterm_current_path "$1" ;;
   esac
 }
 spawn_send_literal() {  # <target> <text>
   case "$BACKEND" in
     tmux) fm_backend_tmux_send_literal "$1" "$2" ;;
     herdr) fm_backend_herdr_send_literal "$1" "$2" ;;
+    wezterm) fm_backend_wezterm_send_literal "$1" "$2" ;;
   esac
 }
 spawn_send_key() {  # <target> <key>
   case "$BACKEND" in
     tmux) fm_backend_tmux_send_key "$1" "$2" ;;
     herdr) fm_backend_herdr_send_key "$1" "$2" ;;
+    wezterm) fm_backend_wezterm_send_key "$1" "$2" ;;
   esac
 }
-if [ "$KIND" != secondmate ] && [ "$BACKEND" != codex-app ]; then
+
+# fm_spawn_assert_isolated_worktree: refuse to launch unless <wt> is a genuine,
+# ISOLATED git worktree distinct from the primary checkout <proj>. Extracted from
+# the pane-driven branch below so the claude-bg lease path enforces the SAME
+# guard: firstmate is a treehouse-pooled repo of itself, so a misfire that leaves
+# a crewmate in the primary checkout would tangle it onto a feature branch (see
+# fm-tangle-lib.sh) regardless of which backend acquired the worktree.
+fm_spawn_assert_isolated_worktree() {  # <wt> <proj-abs> <where>
+  local wt=$1 proj=$2 where=$3 wt_real proj_real wt_top wt_top_real
+  wt_real=$(cd "$wt" 2>/dev/null && pwd -P) || wt_real=
+  proj_real=$(cd "$proj" 2>/dev/null && pwd -P) || proj_real=
+  wt_top=$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null || true)
+  wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P) || wt_top_real=
+  if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
+    echo "error: did not yield an isolated worktree (resolved '$wt'; worktree root '${wt_top:-none}'; primary '$proj'); refusing to launch to avoid tangling the primary checkout. Inspect $where" >&2
+    return 1
+  fi
+  return 0
+}
+
+# claude-bg worktree acquisition. The terminal backends type `treehouse get` into
+# a pane and poll its cwd; with no pane, this uses treehouse's non-interactive
+# durable lease instead, which prints the path on stdout and keeps the worktree
+# reserved with no process living inside it. fm-teardown.sh releases it with
+# `treehouse return`.
+if [ "$BACKEND" = claude-bg ]; then
+  WT=$(cd "$PROJ_ABS" && TREEHOUSE_LEASE_HOLDER="fm-$ID" treehouse get --lease --lease-holder "fm-$ID" 2>/dev/null) || WT=
+  WT=$(printf '%s' "$WT" | tr -d '\r')
+  [ -n "$WT" ] || { echo "error: treehouse get --lease did not return a worktree for $ID" >&2; exit 1; }
+  [ -d "$WT" ] || { echo "error: treehouse leased '$WT' but it is not a directory" >&2; exit 1; }
+  fm_spawn_assert_isolated_worktree "$WT" "$PROJ_ABS" "lease for $ID" || exit 1
+fi
+
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != codex-app ] && [ "$BACKEND" != claude-bg ]; then
   spawn_send_text_line "$T" 'treehouse get'
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
@@ -645,23 +717,7 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != codex-app ]; then
   # checkout; branching/committing there would tangle the primary onto a feature
   # branch (see fm-tangle-lib.sh). The wait loop above only proves the pane left
   # PROJ_ABS's exact path; this proves it landed in a true, separate worktree.
-  wt_real=
-  if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
-    wt_real=
-  fi
-  proj_real=
-  if ! proj_real=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P); then
-    proj_real=
-  fi
-  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
-  wt_top_real=
-  if ! wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P); then
-    wt_top_real=
-  fi
-  if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
-    echo "error: treehouse get did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect window $T" >&2
-    exit 1
-  fi
+  fm_spawn_assert_isolated_worktree "$WT" "$PROJ_ABS" "window $T" || exit 1
 fi
 
 # Per-task temp root with Go's build temp nested at gotmp/. Go won't create
@@ -670,7 +726,11 @@ fi
 # under state/tmp so Codex Desktop work stays inside the FirstMate install.
 # GOTMPDIR, not TMPDIR, is the targeted knob.
 case "$BACKEND" in
-  codex-app) TASK_TMP="$STATE/tmp/fm-$ID" ;;
+  # codex-app and claude-bg keep temp under state/tmp: both run as native
+  # Windows processes that never see Git Bash's /tmp mount, so the upstream
+  # /tmp/fm-<id> convention would resolve to a different directory for the agent
+  # than for this script (or not exist at all).
+  codex-app|claude-bg) TASK_TMP="$STATE/tmp/fm-$ID" ;;
   *) TASK_TMP="/tmp/fm-$ID" ;;
 esac
 mkdir -p "$TASK_TMP/gotmp"
@@ -821,6 +881,15 @@ fi
     echo "codex_app_transport=visible-thread"
     echo "codex_app_brief=$BRIEF"
   fi
+  if [ "$BACKEND" = claude-bg ]; then
+    echo "claude_bg_session=$T"
+    # The terminal backends' worktrees are held by a live `treehouse get`
+    # subshell and released when that shell dies with the pane. A claude-bg
+    # worktree is held by a DURABLE LEASE with no process inside it, so nothing
+    # releases it implicitly - fm-teardown.sh must run `treehouse return`. This
+    # flag is how teardown knows the difference.
+    echo "worktree_lease=1"
+  fi
   if [ "$KIND" = secondmate ]; then
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
@@ -849,6 +918,21 @@ if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_HOME=$sq_home $LAUNCH"
 fi
+# claude-bg launches here rather than through the pane send sequence: there is
+# no shell to type into, so the brief becomes the agent's first prompt and
+# GOTMPDIR is exported into this subshell for `claude --bg` to inherit directly.
+# The brief CONTENTS are passed (not its path), matching the terminal claude
+# launch template's `"$(cat __BRIEF__)"`, so a crewmate on either backend starts
+# from byte-identical instructions.
+if [ "${CLAUDE_BG_PENDING:-0}" = 1 ]; then
+  CLAUDE_BG_PROMPT=$(cat "$BRIEF") || { echo "error: could not read brief at $BRIEF" >&2; exit 1; }
+  export GOTMPDIR="$TASK_TMP/gotmp"
+  fm_backend_claude_bg_create_task "claude-bg" "$T" "$WT" "$CLAUDE_BG_PROMPT" >/dev/null || exit 1
+  echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO backend=$BACKEND session=$T worktree=$WT"
+  echo "note: claude-bg crewmates are headless; watch them with 'claude agents --json' or bin/fm-peek.sh fm-$ID"
+  exit 0
+fi
+
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.

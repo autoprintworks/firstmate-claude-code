@@ -42,7 +42,12 @@ FM_BACKEND_STATE_DIR="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # data/fm-backend-design-d7/herdr-addendum.md) - verified against the real
 # v0.7.1/protocol-14 binary (data/fm-backend-design-d7/herdr-verification-p2.md)
 # but newer than tmux's long-proven default path.
-FM_BACKEND_KNOWN="tmux herdr codex-app"
+# wezterm is the visible-crew backend for native Windows (bin/backends/wezterm.sh):
+# `wezterm cli` supplies every primitive the tmux adapter exports, including the
+# cursor row via `list --format json`. claude-bg is its unattended counterpart
+# (bin/backends/claude-bg.sh): headless `claude --bg` crewmates supervised from
+# `claude agents --json`, the only backend besides herdr with real busy_state.
+FM_BACKEND_KNOWN="tmux herdr codex-app wezterm claude-bg"
 
 # fm_backend_is_known: 0 iff <name> has a verified adapter.
 fm_backend_is_known() {  # <name>
@@ -70,6 +75,17 @@ fm_backend_detect() {
   fi
   if [ "${HERDR_ENV:-}" = "1" ]; then
     printf 'herdr'
+    return 0
+  fi
+  # WezTerm sets WEZTERM_PANE in every process it spawns a pane for, the same
+  # marker shape as $TMUX and HERDR_ENV=1. It is checked LAST of the three so a
+  # tmux or herdr session running inside a WezTerm window still resolves to the
+  # inner multiplexer - innermost-first, matching the $TMUX-beats-HERDR_ENV rule
+  # above. claude-bg is deliberately NOT auto-detected: it is a deployment
+  # choice (unattended vs visible), not a property of the runtime firstmate
+  # happens to be executing in.
+  if [ -n "${WEZTERM_PANE:-}" ]; then
+    printf 'wezterm'
     return 0
   fi
   return 1
@@ -219,6 +235,20 @@ fm_backend_source() {  # <name>
       ;;
     codex-app)
       ;;
+    wezterm)
+      if [ -z "${_FM_BACKEND_WEZTERM_SOURCED:-}" ]; then
+        # shellcheck source=bin/backends/wezterm.sh
+        . "$FM_BACKEND_LIB_DIR/backends/wezterm.sh"
+        _FM_BACKEND_WEZTERM_SOURCED=1
+      fi
+      ;;
+    claude-bg)
+      if [ -z "${_FM_BACKEND_CLAUDE_BG_SOURCED:-}" ]; then
+        # shellcheck source=bin/backends/claude-bg.sh
+        . "$FM_BACKEND_LIB_DIR/backends/claude-bg.sh"
+        _FM_BACKEND_CLAUDE_BG_SOURCED=1
+      fi
+      ;;
   esac
 }
 
@@ -283,6 +313,8 @@ fm_backend_capture() {  # <backend> <target> <lines>
   case "$backend" in
     tmux) fm_backend_tmux_capture "$@" ;;
     herdr) fm_backend_herdr_capture "$@" ;;
+    wezterm) fm_backend_wezterm_capture "$@" ;;
+    claude-bg) fm_backend_claude_bg_capture "$@" ;;
     codex-app)
       thread_id=$(fm_backend_codex_app_thread_id "$1" 2>/dev/null || true)
       [ -n "$thread_id" ] || { echo "error: no thread_id recorded for Codex App target '$1'" >&2; return 1; }
@@ -300,6 +332,8 @@ fm_backend_send_key() {  # <backend> <target> <key>
   case "$backend" in
     tmux) fm_backend_tmux_send_key "$@" ;;
     herdr) fm_backend_herdr_send_key "$@" ;;
+    wezterm) fm_backend_wezterm_send_key "$@" ;;
+    claude-bg) fm_backend_claude_bg_send_key "$@" ;;
     codex-app)
       thread_id=$(fm_backend_codex_app_thread_id "$1" 2>/dev/null || true)
       [ -n "$thread_id" ] || { echo "error: no thread_id recorded for Codex App target '$1'" >&2; return 1; }
@@ -324,6 +358,8 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
   case "$backend" in
     tmux) fm_backend_tmux_send_text_submit "$@" ;;
     herdr) fm_backend_herdr_send_text_submit "$@" ;;
+    wezterm) fm_backend_wezterm_send_text_submit "$@" ;;
+    claude-bg) fm_backend_claude_bg_send_text_submit "$@" ;;
     codex-app)
       thread_id=$(fm_backend_codex_app_thread_id "$1" 2>/dev/null || true)
       if [ -z "$thread_id" ]; then
@@ -351,6 +387,8 @@ fm_backend_kill() {  # <backend> <target>
   case "$backend" in
     tmux) fm_backend_tmux_kill "$@" ;;
     herdr) fm_backend_herdr_kill "$@" ;;
+    wezterm) fm_backend_wezterm_kill "$@" ;;
+    claude-bg) fm_backend_claude_bg_kill "$@" ;;
     codex-app) return 0 ;;
     *) echo "error: no kill implementation for backend '$backend'" >&2; return 1 ;;
   esac
@@ -367,6 +405,7 @@ fm_backend_busy_state() {  # <backend> <target>
   fm_backend_source "$backend" || { printf 'unknown'; return 0; }
   case "$backend" in
     herdr) fm_backend_herdr_busy_state "$@" ;;
+    claude-bg) fm_backend_claude_bg_busy_state "$@" ;;
     *) printf 'unknown' ;;
   esac
 }
