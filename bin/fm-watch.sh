@@ -37,6 +37,28 @@ fm_watch_debug() {
     "$*" >> "${FM_WATCH_DEBUG_LOG:-$STATE/.watch-debug.log}"
 }
 
+TRIAGE_LOG="$STATE/.watch-triage.log"
+TRIAGE_LOG_MAX_BYTES=${FM_WATCH_TRIAGE_LOG_MAX_BYTES:-262144}
+
+# Append one line to the triage debug log explaining an absorbed (benign) wake,
+# size-capped so a long benign stretch cannot grow it without bound. Best-effort:
+# a logging hiccup never affects supervision.
+#
+# Defined HERE, above the startup fastpath block, rather than beside the rest of
+# the triage policy further down: the python fastpaths run before that point and
+# absorb wakes of their own, and a function referenced before its definition is
+# a runtime "command not found". Everything it needs is $STATE, set above.
+triage_log() {
+  local sz
+  printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$TRIAGE_LOG" 2>/dev/null || return 0
+  sz=$(wc -c < "$TRIAGE_LOG" 2>/dev/null | tr -d '[:space:]')
+  case "$sz" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$sz" -ge "$TRIAGE_LOG_MAX_BYTES" ]; then
+    tail -n 2000 "$TRIAGE_LOG" > "$TRIAGE_LOG.tmp" 2>/dev/null && mv -f "$TRIAGE_LOG.tmp" "$TRIAGE_LOG" 2>/dev/null
+    rm -f "$TRIAGE_LOG.tmp" 2>/dev/null || true
+  fi
+}
+
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 WATCH_LOCK="$STATE/.watch.lock"
@@ -155,7 +177,14 @@ if state_has_meta; then
     fastpath_rc=$?
     case "$fastpath_rc" in
       10) fm_watch_debug "startup-stale-fastpath pending=no" ;;
-      11) fm_watch_debug "startup-stale-fastpath absorbed" ;;
+      # An absorbed wake is logged the same way whether the shell triage path or
+      # the python fastpath absorbed it. Without this the triage log silently
+      # omits every wake the fastpath handled, which is MOST of them on any
+      # machine where `python` resolves - and the log's whole purpose is to
+      # explain absorbed wakes. It is also what keeps the size cap running on
+      # fastpath-dominated machines.
+      11) fm_watch_debug "startup-stale-fastpath absorbed"
+          triage_log "absorbed benign stale (startup stale fastpath)" ;;
     esac
   fi
 fi
@@ -167,7 +196,8 @@ else
   fastpath_rc=$?
   case "$fastpath_rc" in
     10) fm_watch_debug "startup-fastpath pending=no" ;;
-    11) fm_watch_debug "startup-fastpath absorbed" ;;
+    11) fm_watch_debug "startup-fastpath absorbed"
+        triage_log "absorbed benign signal (startup signal fastpath)" ;;
   esac
 fi
 # Shared wake classifier (captain-relevant verbs + signal/stale/heartbeat
@@ -228,28 +258,14 @@ BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
 # daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
 # wake) and never double-triages - and never runs the costly provably-working read.
 STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a non-terminal stale escalates as a possible wedge
-TRIAGE_LOG="$STATE/.watch-triage.log"
-TRIAGE_LOG_MAX_BYTES=${FM_WATCH_TRIAGE_LOG_MAX_BYTES:-262144}
+# TRIAGE_LOG / TRIAGE_LOG_MAX_BYTES / triage_log() are defined near the top of
+# this script, above the startup fastpath block that also needs them.
 
 # afk_present: 0 while the away-mode flag exists. When set, the daemon wraps this
 # watcher and owns triage, so the watcher must behave one-shot (enqueue + exit on
 # every wake) and let the daemon classify - never absorb here, or the daemon's
 # digest/injection layer would never see the wake.
 afk_present() { [ -e "$STATE/.afk" ]; }
-
-# Append one line to the triage debug log explaining an absorbed (benign) wake,
-# size-capped so a long benign stretch cannot grow it without bound. Best-effort:
-# a logging hiccup never affects supervision.
-triage_log() {
-  local sz
-  printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$TRIAGE_LOG" 2>/dev/null || return 0
-  sz=$(wc -c < "$TRIAGE_LOG" 2>/dev/null | tr -d '[:space:]')
-  case "$sz" in ''|*[!0-9]*) return 0 ;; esac
-  if [ "$sz" -ge "$TRIAGE_LOG_MAX_BYTES" ]; then
-    tail -n 2000 "$TRIAGE_LOG" > "$TRIAGE_LOG.tmp" 2>/dev/null && mv -f "$TRIAGE_LOG.tmp" "$TRIAGE_LOG" 2>/dev/null
-    rm -f "$TRIAGE_LOG.tmp" 2>/dev/null || true
-  fi
-}
 
 hash_pane() {
   if command -v md5 >/dev/null 2>&1; then md5 -q; else md5sum | cut -d' ' -f1; fi
@@ -565,6 +581,7 @@ while :; do
         11)
           stale_fastpath_done=true
           fm_watch_debug "stale-fastpath absorbed"
+          triage_log "absorbed benign stale (stale fastpath)"
           ;;
       esac
     fi
@@ -584,6 +601,7 @@ while :; do
       11)
         signal_fastpath_done=true
         fm_watch_debug "signals-fastpath absorbed"
+        triage_log "absorbed benign signal (signal fastpath)"
         ;;
     esac
   fi
