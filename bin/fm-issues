@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# FirstMate IssueOps entrypoint.
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+PYTHON_BIN="${PYTHON:-python}"
+
+case "${PYTHONPATH:-}" in
+  "$FM_ROOT"|"$FM_ROOT":*) ;;
+  *) export PYTHONPATH="$FM_ROOT${PYTHONPATH:+:$PYTHONPATH}" ;;
+esac
+
+exec "$PYTHON_BIN" -m firstmate_gui_agnostic.issueops "$@"
