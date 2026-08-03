@@ -16,6 +16,8 @@
 # which is how every linked worktree and secondmate home legitimately sits on the
 # default branch. Detached HEAD on the default is fine; a feature branch in a
 # primary checkout is the alarm.
+# shellcheck source=bin/fm-git-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-git-lib.sh"
 
 # Resolve the default branch name of the git repo at <dir>: prefer origin/HEAD,
 # then fall back to a local main/master. Echoes the name, or returns 1.
