@@ -66,8 +66,14 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # spawn-capable; unlike tmux/herdr/zellij it is also the worktree provider.
 # cmux is EXPERIMENTAL and spawn-capable, session-provider-only like
 # herdr/zellij - verified against the real 0.64.17 binary (docs/cmux-backend.md).
-FM_BACKEND_KNOWN="tmux herdr zellij orca cmux codex-app"
-FM_BACKEND_SPAWN="tmux herdr zellij orca cmux codex-app"
+# wezterm is the visible-crew backend for native Windows (bin/backends/wezterm.sh):
+# `wezterm cli` supplies every primitive the tmux adapter exports, including the
+# cursor row via `list --format json`. claude-bg is its unattended counterpart
+# (bin/backends/claude-bg.sh): headless `claude --bg` crewmates supervised from
+# structured state (`claude agents --json`) rather than rendered text. Both are
+# EXPERIMENTAL, carried from the claude-app-backend Windows line.
+FM_BACKEND_KNOWN="tmux herdr zellij orca cmux codex-app wezterm claude-bg"
+FM_BACKEND_SPAWN="tmux herdr zellij orca cmux codex-app wezterm claude-bg"
 
 # fm_backend_list_contains: whitespace-delimited membership without relying on
 # shell word splitting. fm-backend.sh is normally sourced by bash scripts, but
@@ -150,6 +156,18 @@ fm_backend_detect() {
     FM_BACKEND_DETECTED=herdr
     FM_BACKEND_DETECT_SIGNAL=HERDR_ENV
     printf 'herdr'
+    return 0
+  fi
+  # WezTerm sets WEZTERM_PANE in every process it spawns a pane for, the same
+  # per-pane marker pattern as $TMUX and HERDR_ENV. It is checked after the
+  # multiplexers because tmux or herdr running inside a WezTerm window is the
+  # innermost, currently-executing layer and must win. claude-bg is
+  # deliberately NOT auto-detected: it is a deployment choice (headless
+  # crewmates), never an ambient runtime.
+  if [ -n "${WEZTERM_PANE:-}" ]; then
+    FM_BACKEND_DETECTED=wezterm
+    FM_BACKEND_DETECT_SIGNAL=WEZTERM_PANE
+    printf 'wezterm'
     return 0
   fi
   if [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
@@ -262,6 +280,9 @@ fm_backend_name() {
     if [ "$detected" = herdr ]; then
       echo "NOTICE: auto-detected herdr runtime (HERDR_ENV=1) - spawning into the EXPERIMENTAL herdr backend. Set config/backend or pass --backend tmux to opt out." >&2
     fi
+    if [ "$detected" = wezterm ]; then
+      echo "NOTICE: auto-detected WezTerm runtime (WEZTERM_PANE set) - spawning into the EXPERIMENTAL wezterm backend. Set config/backend or pass --backend tmux to opt out." >&2
+    fi
     if [ "$detected" = cmux ]; then
       case "$FM_BACKEND_DETECT_SIGNAL" in
         bundle-id) marker="FALLBACK signal __CFBundleIdentifier=$FM_BACKEND_CMUX_BUNDLE_ID; CMUX_WORKSPACE_ID absent, stripped by cmux's bundled claude wrapper" ;;
@@ -316,6 +337,8 @@ fm_backend_required_tools() {  # <backend>
     cmux)   printf '%s' 'cmux jq treehouse' ;;
     orca)   printf '%s' 'orca' ;;
     codex-app) printf '%s' 'node' ;;
+    wezterm)   printf '%s' 'wezterm treehouse' ;;
+    claude-bg) printf '%s' 'claude treehouse' ;;
     *) return 1 ;;
   esac
 }
@@ -524,6 +547,32 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
         return 1
       fi
       ;;
+    wezterm)
+      # A WezTerm target is a server-assigned pane id (an integer, no colon),
+      # so the task label cannot be derived from it; require the exact binding.
+      [ "$binding" = "$id" ] || {
+        echo "REFUSED: WezTerm endpoint metadata for task $id lacks an exact task binding; preserving task state." >&2
+        return 1
+      }
+      case "$window" in
+        ''|*[!0-9]*)
+          echo "REFUSED: WezTerm endpoint metadata for task $id is malformed (pane id '$window'); preserving task state." >&2
+          return 1
+          ;;
+      esac
+      ;;
+    claude-bg)
+      # A claude-bg target is the firstmate-chosen session UUID (no colon),
+      # opaque to the task label; require the exact binding.
+      [ "$binding" = "$id" ] || {
+        echo "REFUSED: claude-bg endpoint metadata for task $id lacks an exact task binding; preserving task state." >&2
+        return 1
+      }
+      if ! fm_backend_endpoint_atom_valid "$window"; then
+        echo "REFUSED: claude-bg endpoint metadata for task $id is malformed (session id '$window'); preserving task state." >&2
+        return 1
+      fi
+      ;;
     codex-app)
       [ "$binding" = "$id" ] || {
         echo "REFUSED: Codex App endpoint metadata for task $id lacks an exact task binding; preserving task state." >&2
@@ -651,6 +700,20 @@ fm_backend_source() {  # <name>
         _FM_BACKEND_CODEX_APP_SOURCED=1
       fi
       ;;
+    wezterm)
+      if [ -z "${_FM_BACKEND_WEZTERM_SOURCED:-}" ]; then
+        # shellcheck source=/dev/null
+        . "$FM_BACKEND_LIB_DIR/backends/wezterm.sh" || return 1
+        _FM_BACKEND_WEZTERM_SOURCED=1
+      fi
+      ;;
+    claude-bg)
+      if [ -z "${_FM_BACKEND_CLAUDE_BG_SOURCED:-}" ]; then
+        # shellcheck source=/dev/null
+        . "$FM_BACKEND_LIB_DIR/backends/claude-bg.sh" || return 1
+        _FM_BACKEND_CLAUDE_BG_SOURCED=1
+      fi
+      ;;
   esac
 }
 
@@ -723,6 +786,8 @@ fm_backend_capture() {  # <backend> <target> <lines> [expected-label]
     orca) fm_backend_orca_capture "$@" ;;
     cmux) fm_backend_cmux_capture "$@" ;;
     codex-app) fm_backend_codex_app_capture "$@" ;;
+    wezterm) fm_backend_wezterm_capture "$@" ;;
+    claude-bg) fm_backend_claude_bg_capture "$@" ;;
     *) echo "error: no capture implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -739,6 +804,8 @@ fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
     orca) fm_backend_orca_send_key "$@" ;;
     cmux) fm_backend_cmux_send_key "$@" ;;
     codex-app) fm_backend_codex_app_send_key "$@" ;;
+    wezterm) fm_backend_wezterm_send_key "$@" ;;
+    claude-bg) fm_backend_claude_bg_send_key "$@" ;;
     *) echo "error: no send-key implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -757,6 +824,8 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
     orca) fm_backend_orca_send_text_submit "$@" ;;
     cmux) fm_backend_cmux_send_text_submit "$@" ;;
     codex-app) fm_backend_codex_app_send_text_submit "$@" ;;
+    wezterm) fm_backend_wezterm_send_text_submit "$@" ;;
+    claude-bg) fm_backend_claude_bg_send_text_submit "$@" ;;
     *) echo "error: no send-text implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -776,6 +845,8 @@ fm_backend_kill() {  # <backend> <target>
     orca) fm_backend_orca_kill "$@" ;;
     cmux) fm_backend_cmux_kill "$@" ;;
     codex-app) fm_backend_codex_app_kill "$@" ;;
+    wezterm) fm_backend_wezterm_kill "$@" ;;
+    claude-bg) fm_backend_claude_bg_kill "$@" ;;
     *) echo "error: no kill implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -813,6 +884,7 @@ fm_backend_busy_state() {  # <backend> <target>
   fm_backend_source "$backend" || { printf 'unknown'; return 0; }
   case "$backend" in
     herdr) fm_backend_herdr_busy_state "$@" ;;
+    claude-bg) fm_backend_claude_bg_busy_state "$@" ;;
     *) printf 'unknown' ;;
   esac
 }
@@ -838,6 +910,7 @@ fm_backend_composer_state() {  # <backend> <target> -> empty|pending|pending-unp
     herdr) fm_backend_herdr_composer_state "$@" ;;
     orca) fm_backend_orca_composer_state "$@" ;;
     cmux) fm_backend_cmux_composer_state "$@" ;;
+    wezterm) fm_wezterm_composer_state "$@" ;;
     *) printf 'unknown' ;;
   esac
 }
@@ -890,6 +963,14 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
     codex-app)
       fm_backend_source codex-app || return 1
       fm_backend_codex_app_target_exists "$target"
+      ;;
+    wezterm)
+      fm_backend_source wezterm || return 1
+      fm_wezterm_pane_exists "$target"
+      ;;
+    claude-bg)
+      fm_backend_source claude-bg || return 1
+      [ -n "$(fm_backend_claude_bg_field "$target" state)" ]
       ;;
     *)
       return 1

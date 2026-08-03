@@ -112,9 +112,37 @@ fm_wezterm_capture() {  # <pane-id> <lines>
   fm_wezterm_cli get-text --pane-id "$1" --start-line "-$2"
 }
 
+# fm_wezterm_classify_line: strip the harness's box-drawing composer borders
+# from one ghost-stripped row, trim it, and hand the result to the shared
+# fm_composer_classify_content verdict. The bordered flag records whether the
+# row carried a real composer-box border, so the fleet-wide safety rule holds
+# here too: a bare shell prompt glyph on an unstructured row is never read as
+# an empty agent composer. A busy footer landing on the cursor row is not
+# pending input (it is the harness mid-turn), matching fm-watch.sh's regex.
+fm_wezterm_classify_line() {  # <ghost-stripped-line> -> empty|pending|unknown
+  local line=$1 stripped bordered=0
+  case "$line" in
+    *│*|*┃*|*'|'*) bordered=1 ;;
+  esac
+  stripped=${line//│/}      # U+2502 light vertical (claude)
+  stripped=${stripped//┃/}  # U+2503 heavy vertical
+  stripped=${stripped//|/}  # ASCII pipe
+  stripped="${stripped#"${stripped%%[![:space:]]*}"}"
+  stripped="${stripped%"${stripped##*[![:space:]]}"}"
+  if [ -z "$stripped" ]; then
+    if [ "$bordered" = 1 ]; then printf 'empty'; else printf 'unknown'; fi
+    return 0
+  fi
+  # A busy footer landing on the cursor line is not pending input.
+  if printf '%s' "$stripped" | grep -qiE "$(fm_composer_busy_regex)"; then
+    printf 'empty'; return 0
+  fi
+  fm_composer_classify_content "$bordered" "$stripped" "${FM_COMPOSER_IDLE_RE:-}" insensitive
+}
+
 # fm_wezterm_composer_state: the WezTerm twin of fm_tmux_composer_state, with
-# identical verdicts (empty|pending|unknown) because the classification is the
-# shared fm_composer_classify_line.
+# identical verdicts (empty|pending|unknown) because the border stripping and
+# content classification delegate to the shared fm-composer-lib.sh owner.
 #
 # cursor_y comes from the JSON inventory rather than a dedicated query (WezTerm
 # has no `display-message -p` equivalent), and the single composer row is then
@@ -128,7 +156,7 @@ fm_wezterm_composer_state() {  # <pane-id> -> empty|pending|unknown
   raw=$(fm_wezterm_cli get-text --pane-id "$pane" --escapes \
           --start-line "$cy" --end-line "$cy") || { printf 'unknown'; return 0; }
   line=$(printf '%s\n' "$raw" | head -1 | fm_composer_strip_ghost)
-  fm_composer_classify_line "$line"
+  fm_wezterm_classify_line "$line"
 }
 
 # fm_wezterm_input_pending: 0 iff the composer holds real unsubmitted text.

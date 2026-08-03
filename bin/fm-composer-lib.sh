@@ -222,3 +222,54 @@ fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [
   # Real, unsubmitted content remains.
   printf 'pending'; return 0
 }
+
+# --- portable-runtime helpers (carried from the wezterm/claude-bg backend
+# work on the Windows-maintained line) ----------------------------------------
+
+# Busy footers per harness (mirror fm-watch.sh). claude/codex: "esc to
+# interrupt"; opencode: "esc interrupt"; pi: "Working..."; grok: "Ctrl+c:cancel"
+# (grok's mid-turn cancel hint, shown iff a turn is running - verified grok 0.2.73).
+FM_COMPOSER_BUSY_REGEX_DEFAULT='esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'
+
+# fm_composer_busy_regex: the active busy-footer pattern, honoring the
+# FM_BUSY_REGEX per-harness override that fm-watch.sh and the daemon also read.
+fm_composer_busy_regex() {
+  printf '%s' "${FM_BUSY_REGEX:-$FM_COMPOSER_BUSY_REGEX_DEFAULT}"
+}
+
+# fm_composer_python: a python interpreter that ACTUALLY RUNS, or empty.
+#
+# `command -v python3` is not sufficient on Windows: Microsoft ships an App
+# Execution Alias at %LOCALAPPDATA%\Microsoft\WindowsApps\python3 that exists
+# as a file, satisfies command -v, and then refuses to execute with "Python was
+# not found; run without arguments to install from the Microsoft Store". An
+# adapter that trusts command -v silently loses every JSON lookup it makes - the
+# wezterm adapter read an empty pane record and reported composer state
+# `unknown` forever, which degrades to "crewmate unreadable" rather than
+# failing loudly. So each candidate is probed by RUNNING it.
+#
+# The result is cached in FM_COMPOSER_PYTHON for the life of the shell: the
+# watcher calls this on every poll and a per-tick interpreter probe would double
+# the cost of the loop. Set FM_PYTHON to pin an interpreter explicitly.
+fm_composer_python() {
+  if [ -n "${FM_COMPOSER_PYTHON:-}" ]; then
+    printf '%s' "$FM_COMPOSER_PYTHON"
+    return 0
+  fi
+  local cand
+  for cand in ${FM_PYTHON:-} python3 python py; do
+    if "$cand" -c 'import sys, json' >/dev/null 2>&1; then
+      FM_COMPOSER_PYTHON="$cand"
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# fm_composer_tail_is_busy: 0 iff the last few non-blank lines of a captured
+# tail show a busy footer (an agent mid-turn). Reads the tail on stdin. Mirrors
+# the 6-of-40-line scan fm-watch.sh and fm_pane_is_busy already performed.
+fm_composer_tail_is_busy() {
+  grep -v '^[[:space:]]*$' | tail -6 | grep -qiE "$(fm_composer_busy_regex)"
+}
