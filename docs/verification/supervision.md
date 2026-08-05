@@ -143,9 +143,40 @@ Observed output:
 ok - Claude 2.1.219 (Claude Code) live E2E reclaimed a stale session lock through session start, completed two tokenless Stop-owned rewake cycles, and preserved the competing-live-owner boundary
 ```
 
+### Windows session-lock identity
+
+On MSYS/Git Bash the harness is a native Windows process outside the shell's pid namespace, so `kill -0`, `/proc/<pid>` and `ps -o comm= -p` all miss it and the POSIX ancestry walk in `fm_harness_ancestry_pid()` cannot resolve an owner at all.
+Every Windows session therefore failed lock acquisition with `error: cannot locate harness process in ancestry` and ran read-only, and the Stop auto-arm never armed.
+`bin/fm-session-lock-lib.sh` now carries a Windows arm: the harness pid comes from `CLAUDE_PID` where the harness exports it and from a Toolhelp32 ancestry walk (`firstmate_gui_agnostic/win_ancestry.py`) otherwise, and holder liveness compares the full native image path from `ps -W`.
+
+Measured on 2026-08-05 with Claude Code 2.1.222, MSYS 3.6.7 (`MINGW64_NT-10.0-26200`, `$OSTYPE` reporting `cygwin`), Python 3.13.3, inside a live T3 Code 0.0.31 thread.
+The full image path is what makes a stale lock readable as stale: this machine ran 17 Claude Desktop `claude.exe` processes alongside 5 of the CLI, so a basename match would let a recycled pid keep a dead session's lock alive forever.
+
+```sh
+python firstmate_gui_agnostic/win_ancestry.py --start "$(cat /proc/$$/winpid)" --chain
+printf '20744\n' > "$H/state/.lock" && FM_HOME="$H" bin/fm-lock.sh   # another live CLI claude
+printf '20804\n' > "$H/state/.lock" && FM_HOME="$H" bin/fm-lock.sh status && FM_HOME="$H" bin/fm-lock.sh   # Claude Desktop
+```
+
+Observed output:
+
+```text
+47056	bash.exe
+69040	bash.exe
+28568	claude.exe
+16984	T3 Code (Alpha).exe
+error: another live firstmate session holds the lock (pid 20744); operate read-only until resolved
+lock: stale (pid 20804 dead or not a harness)
+lock acquired: harness pid 28568
+```
+
+The ancestry walk and `CLAUDE_PID` agreed on pid 28568, so either resolver reaches the same owner.
+With the pre-arm library the same fixture printed `error: cannot locate harness process in ancestry` and the Stop hook exited 0 without arming; with the arm it armed and returned the exit-2 rewake.
+
 Current entry points:
 
 ```sh
+tests/fm-session-lock-windows.test.sh
 tests/fm-turnend-guard.test.sh
 tests/fm-supervision-instructions.test.sh
 FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh
