@@ -1244,6 +1244,35 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
+# t3 is torn down BEFORE its worktree is returned, which reverses the order every
+# other pane-less backend uses and is deliberate. A T3 crewmate's process belongs
+# to the T3 Code server, not to this machine's process tree, so `treehouse return
+# --force` cannot reap it the way it reaps a claude-bg agent. Returning the
+# worktree first would pull the ground out from under a still-running agent and
+# leave a live thread pointed at a directory that has just been reset.
+#
+# Stopping first is also what makes the checkpoint sweep safe: the thread has
+# stopped writing new refs by the time the sweep runs.
+if [ "$BACKEND" = t3 ]; then
+  fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+  # T3 writes refs/t3/checkpoints/<thread>/turn/N into the PROJECT's common ref
+  # store, one per turn, each pinning a commit that holds the crewmate's entire
+  # working tree including files it never committed. Only `thread.delete` sweeps
+  # them and firstmate's teardown archives instead, so nothing else ever will.
+  # Run from $PROJ, not $WT: the worktree is about to be reset and may not
+  # survive, while the project checkout is where the refs actually live.
+  #
+  # This is an explicit branch rather than something inferred from a meta flag
+  # alone. worktree_lease=1 has been written by fm-spawn.sh since claude-bg
+  # landed and is read by nothing in bin/ — a flag with no reader is not a
+  # behavior, it is a comment that looks like one.
+  if [ "$(meta_value "$META" t3_checkpoint_refs)" = 1 ]; then
+    if fm_backend_source t3; then
+      fm_backend_t3_sweep_checkpoint_refs "$T" "$PROJ" || true
+    fi
+  fi
+fi
+
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then

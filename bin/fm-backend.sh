@@ -72,8 +72,16 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # (bin/backends/claude-bg.sh): headless `claude --bg` crewmates supervised from
 # structured state (`claude agents --json`) rather than rendered text. Both are
 # EXPERIMENTAL, carried from the claude-app-backend Windows line.
-FM_BACKEND_KNOWN="tmux herdr zellij orca cmux codex-app wezterm claude-bg"
-FM_BACKEND_SPAWN="tmux herdr zellij orca cmux codex-app wezterm claude-bg"
+# t3 is EXPERIMENTAL and spawn-capable (bin/backends/t3.sh): crewmates are
+# THREADS inside the T3 Code desktop app, driven over its orchestration HTTP API
+# through bin/fm-t3. It is the only backend whose crewmates are both unattended
+# and watchable - the human can read and type into a thread in the app while
+# firstmate supervises it from the server's own session status, which also makes
+# it the first backend to report `blocked` from a real permission gate rather
+# than inferring one. Like codex-app it does not own the crewmate's process, so
+# teardown archives the thread rather than killing a pane.
+FM_BACKEND_KNOWN="tmux herdr zellij orca cmux codex-app wezterm claude-bg t3"
+FM_BACKEND_SPAWN="tmux herdr zellij orca cmux codex-app wezterm claude-bg t3"
 
 # fm_backend_list_contains: whitespace-delimited membership without relying on
 # shell word splitting. fm-backend.sh is normally sourced by bash scripts, but
@@ -339,6 +347,9 @@ fm_backend_required_tools() {  # <backend>
     codex-app) printf '%s' 'node' ;;
     wezterm)   printf '%s' 'wezterm treehouse' ;;
     claude-bg) printf '%s' 'claude treehouse' ;;
+    # t3 needs no T3 CLI: bin/fm-t3 talks to the running server's HTTP API
+    # directly, so node and the worktree provider are the whole requirement.
+    t3) printf '%s' 'node treehouse' ;;
     *) return 1 ;;
   esac
 }
@@ -585,6 +596,29 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
         return 1
       fi
       ;;
+    t3)
+      # A t3 target is the firstmate-chosen T3 thread UUID (no colon), opaque to
+      # the task label, so require the exact binding. The recorded t3_thread must
+      # agree with it: teardown archives that thread and sweeps its checkpoint
+      # refs, and a disagreement here would aim both at the wrong crewmate.
+      [ "$binding" = "$id" ] || {
+        echo "REFUSED: T3 endpoint metadata for task $id lacks an exact task binding; preserving task state." >&2
+        return 1
+      }
+      thread_id=$(fm_backend_meta_exact_value "$meta" t3_thread) || thread_id=
+      case "$window" in
+        ????????-????-????-????-????????????) ;;
+        *)
+          echo "REFUSED: T3 endpoint metadata for task $id is malformed (thread id '$window' is not a UUID); preserving task state." >&2
+          return 1
+          ;;
+      esac
+      if [ -z "$thread_id" ] || [ "$thread_id" != "$window" ] \
+        || ! fm_backend_endpoint_atom_valid "$window"; then
+        echo "REFUSED: T3 endpoint metadata for task $id is malformed or inconsistent; preserving task state." >&2
+        return 1
+      fi
+      ;;
   esac
   # shellcheck disable=SC2034 # Output globals are consumed by sourcing callers.
   FM_BACKEND_VALIDATED_BACKEND=$backend
@@ -714,6 +748,13 @@ fm_backend_source() {  # <name>
         _FM_BACKEND_CLAUDE_BG_SOURCED=1
       fi
       ;;
+    t3)
+      if [ -z "${_FM_BACKEND_T3_SOURCED:-}" ]; then
+        # shellcheck source=/dev/null
+        . "$FM_BACKEND_LIB_DIR/backends/t3.sh" || return 1
+        _FM_BACKEND_T3_SOURCED=1
+      fi
+      ;;
   esac
 }
 
@@ -788,6 +829,7 @@ fm_backend_capture() {  # <backend> <target> <lines> [expected-label]
     codex-app) fm_backend_codex_app_capture "$@" ;;
     wezterm) fm_backend_wezterm_capture "$@" ;;
     claude-bg) fm_backend_claude_bg_capture "$@" ;;
+    t3) fm_backend_t3_capture "$@" ;;
     *) echo "error: no capture implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -806,6 +848,7 @@ fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
     codex-app) fm_backend_codex_app_send_key "$@" ;;
     wezterm) fm_backend_wezterm_send_key "$@" ;;
     claude-bg) fm_backend_claude_bg_send_key "$@" ;;
+    t3) fm_backend_t3_send_key "$@" ;;
     *) echo "error: no send-key implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -826,6 +869,7 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
     codex-app) fm_backend_codex_app_send_text_submit "$@" ;;
     wezterm) fm_backend_wezterm_send_text_submit "$@" ;;
     claude-bg) fm_backend_claude_bg_send_text_submit "$@" ;;
+    t3) fm_backend_t3_send_text_submit "$@" ;;
     *) echo "error: no send-text implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -847,6 +891,7 @@ fm_backend_kill() {  # <backend> <target>
     codex-app) fm_backend_codex_app_kill "$@" ;;
     wezterm) fm_backend_wezterm_kill "$@" ;;
     claude-bg) fm_backend_claude_bg_kill "$@" ;;
+    t3) fm_backend_t3_kill "$@" ;;
     *) echo "error: no kill implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
@@ -885,6 +930,7 @@ fm_backend_busy_state() {  # <backend> <target>
   case "$backend" in
     herdr) fm_backend_herdr_busy_state "$@" ;;
     claude-bg) fm_backend_claude_bg_busy_state "$@" ;;
+    t3) fm_backend_t3_busy_state "$@" ;;
     *) printf 'unknown' ;;
   esac
 }
@@ -971,6 +1017,10 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
     claude-bg)
       fm_backend_source claude-bg || return 1
       [ -n "$(fm_backend_claude_bg_field "$target" state)" ]
+      ;;
+    t3)
+      fm_backend_source t3 || return 1
+      fm_backend_t3_target_exists "$target"
       ;;
     *)
       return 1

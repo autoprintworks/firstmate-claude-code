@@ -557,6 +557,26 @@ if [ "$BACKEND" = claude-bg ]; then
   esac
 fi
 
+if [ "$BACKEND" = t3 ]; then
+  [ "$KIND" != secondmate ] || {
+    echo "error: backend=t3 does not support --secondmate; use tmux or wezterm for secondmates" >&2
+    exit 1
+  }
+  # There is no shell to run a command in: firstmate hands T3 a thread and a
+  # brief, and T3 launches the provider itself. A raw launch command has nowhere
+  # to go, so refusing it is clearer than silently dropping it.
+  case "$ARG3" in
+    *' '*) echo "error: backend=t3 does not support raw launch commands; use the claude harness" >&2; exit 1 ;;
+  esac
+  # T3 wraps several providers, but only its claudeAgent instance is wired here:
+  # bin/fm-t3 resolves the model selection from that instance, and the turn-end
+  # and busy-state hooks below are the claude ones.
+  case "$HARNESS" in
+    claude*) ;;
+    *) echo "error: backend=t3 supports only the claude harness (got '$HARNESS')" >&2; exit 1 ;;
+  esac
+fi
+
 case "$HARNESS" in
   pi|pi-signed) LAUNCH="FM_PI_HARNESS=$HARNESS $LAUNCH" ;;
 esac
@@ -1256,6 +1276,25 @@ EOF
     [ -n "$T" ] || { echo "error: could not mint a claude-bg session id" >&2; exit 1; }
     CLAUDE_BG_PENDING=1
     ;;
+  t3)
+    # Structurally the claude-bg arm: a T3 crewmate has no pane, so this only
+    # RESERVES the identity and defers the launch until after the worktree is
+    # leased and the hooks are written (see the t3 launch block near the end of
+    # this script). The same two reasons apply — there is no shell to run
+    # `treehouse get` in, and the brief is the thread's first turn rather than
+    # something typed in afterwards.
+    #
+    # The thread id is CHOSEN here rather than parsed back, so a crash between
+    # launch and meta-write cannot orphan an unfindable crewmate. It is also the
+    # task id's partner in teardown: the checkpoint refs T3 leaves in the project
+    # repo are named after this UUID and nothing else can find them.
+    T3_PY=$(fm_composer_python)
+    [ -n "$T3_PY" ] || { echo "error: t3 needs a working python to mint a thread id" >&2; exit 1; }
+    T=$("$T3_PY" -c 'import uuid; print(uuid.uuid4())') || exit 1
+    T=$(printf '%s' "$T" | tr -d '[:space:]')
+    [ -n "$T" ] || { echo "error: could not mint a t3 thread id" >&2; exit 1; }
+    T3_PENDING=1
+    ;;
   codex-app)
     T="$W"
     WT="codex-app-pending-$ID"
@@ -1359,12 +1398,12 @@ kimi_spawn_fail() {  # <detail>
   echo "error: $1; inspect window $T" >&2
 }
 
-# claude-bg worktree acquisition. The terminal backends type `treehouse get` into
-# a pane and poll its cwd; with no pane, this uses treehouse's non-interactive
-# durable lease instead, which prints the path on stdout and keeps the worktree
-# reserved with no process living inside it. fm-teardown.sh releases it with
-# `treehouse return`.
-if [ "$BACKEND" = claude-bg ]; then
+# Pane-less worktree acquisition (claude-bg and t3). The terminal backends type
+# `treehouse get` into a pane and poll its cwd; with no pane, this uses
+# treehouse's non-interactive durable lease instead, which prints the path on
+# stdout and keeps the worktree reserved with no process living inside it.
+# fm-teardown.sh releases it with `treehouse return`.
+if [ "$BACKEND" = claude-bg ] || [ "$BACKEND" = t3 ]; then
   WT=$(cd "$PROJ_ABS" && TREEHOUSE_LEASE_HOLDER="fm-$ID" treehouse get --lease --lease-holder "fm-$ID" 2>/dev/null) || WT=
   WT=$(printf '%s' "$WT" | tr -d '\r')
   [ -n "$WT" ] || { echo "error: treehouse get --lease did not return a worktree for $ID" >&2; exit 1; }
@@ -1372,7 +1411,7 @@ if [ "$BACKEND" = claude-bg ]; then
   validate_spawn_worktree "treehouse get --lease" "$T"
 fi
 
-if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$BACKEND" != codex-app ] && [ "$BACKEND" != claude-bg ]; then
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$BACKEND" != codex-app ] && [ "$BACKEND" != claude-bg ] && [ "$BACKEND" != t3 ]; then
   spawn_send_text_line "$WT_TARGET" 'treehouse get'
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
@@ -1428,11 +1467,13 @@ fi
 # later, and teardown cleans one deterministic path. GOTMPDIR (not TMPDIR) is the
 # targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
 case "$BACKEND" in
-  # codex-app and claude-bg keep temp under state/tmp: both run as native
-  # Windows processes that never see Git Bash's /tmp mount, so the /tmp/fm-<id>
-  # convention would resolve to a different directory for the agent than for
-  # this script (or not exist at all).
-  codex-app|claude-bg) TASK_TMP="$STATE/tmp/fm-$ID" ;;
+  # codex-app, claude-bg and t3 keep temp under state/tmp: all three run as
+  # native Windows processes that never see Git Bash's /tmp mount, so the
+  # /tmp/fm-<id> convention would resolve to a different directory for the agent
+  # than for this script (or not exist at all). For t3 the process is not even
+  # firstmate's child — it is spawned by the T3 Code server — so a path only Git
+  # Bash can resolve is guaranteed to be wrong.
+  codex-app|claude-bg|t3) TASK_TMP="$STATE/tmp/fm-$ID" ;;
   *) TASK_TMP="/tmp/fm-$ID" ;;
 esac
 mkdir -p "$TASK_TMP/gotmp"
@@ -1451,6 +1492,13 @@ exclude_path() {
   mkdir -p "$(dirname "$EXCL")"
   grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
 }
+# t3 IS armed here, deliberately: the guard excludes secondmates and codex-app
+# and nothing else. A T3 crewmate is a claude agent running in a leased worktree
+# with that worktree as its cwd, so the worktree-resident hook files below are
+# exactly as reachable as they are on claude-bg. The hooks are a corroborating
+# signal rather than the primary one — t3 reports busy state from the T3 server's
+# own session status, which needs no hook at all — but arming them keeps the
+# turn-end contract uniform and costs one file write.
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != codex-app ]; then
   # Arm the semantic busy-state contract (bin/fm-busy-lib.sh) for every
   # adapter with a verified semantic source. The launch brief sent below IS a
@@ -1741,6 +1789,20 @@ META_WINDOW=$T
     # flag is how teardown knows the difference.
     echo "worktree_lease=1"
   fi
+  if [ "$BACKEND" = t3 ]; then
+    # t3_thread duplicates window= on purpose: fm_backend_validate_task_endpoint
+    # cross-checks the two, so a half-written or hand-edited meta cannot aim
+    # teardown's archive and checkpoint sweep at the wrong crewmate.
+    echo "t3_thread=$T"
+    # Same durable-lease story as claude-bg: nothing lives inside the worktree to
+    # release it when it dies, so fm-teardown.sh must run `treehouse return`.
+    echo "worktree_lease=1"
+    # T3 writes a checkpoint ref per turn into the PROJECT's ref store and never
+    # removes it, because firstmate's teardown archives the thread rather than
+    # deleting it. This flag is how teardown knows a sweep is owed; project= above
+    # is where it runs.
+    echo "t3_checkpoint_refs=1"
+  fi
   if [ "$KIND" = secondmate ]; then
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
@@ -1768,6 +1830,22 @@ if [ "${CLAUDE_BG_PENDING:-0}" = 1 ]; then
   fm_backend_claude_bg_create_task "claude-bg" "$T" "$WT" "$CLAUDE_BG_PROMPT" >/dev/null || exit 1
   echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO backend=$BACKEND session=$T worktree=$WT"
   echo "note: claude-bg crewmates are headless; watch them with 'claude agents --json' or bin/fm-peek.sh fm-$ID"
+  exit 0
+fi
+
+# t3 launches here for the same reason claude-bg does: there is no shell to type
+# into, so the brief becomes the thread's first turn. Unlike claude-bg the brief
+# is passed by PATH rather than by contents — the turn goes over HTTP as JSON, so
+# there is no argv length to worry about and no quoting to get wrong.
+#
+# The crewmate's process belongs to the T3 Code server, not to this script, so
+# there is no GOTMPDIR to export into it. TASK_TMP is still created above and
+# still removed by teardown; it is firstmate's scratch for this task, not the
+# agent's.
+if [ "${T3_PENDING:-0}" = 1 ]; then
+  fm_backend_t3_create_task "t3" "$T" "$WT" "$BRIEF" "$PROJ_ABS" "fm-$ID" >/dev/null || exit 1
+  echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO backend=$BACKEND thread=$T worktree=$WT"
+  echo "note: t3 crewmates are threads in the T3 Code app; watch them there or with bin/fm-peek.sh fm-$ID"
   exit 0
 fi
 

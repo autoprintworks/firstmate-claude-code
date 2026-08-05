@@ -1,0 +1,674 @@
+#!/usr/bin/env node
+// Firstmate T3 Code endpoint helper.
+//
+// bin/backends/t3.sh dispatches every wire operation through this file. It
+// exists because bash cannot speak the two things a T3 endpoint needs: JSON
+// rendering of a thread transcript, and one WebSocket RPC at spawn time.
+// Everything else here is a plain HTTP call that curl could make; keeping it in
+// one process keeps the credential handling, the exit-code contract, and the
+// "verify by read" discipline in a single place rather than spread across a
+// dozen shell pipelines.
+//
+// Transport, established empirically (autoprintworks/t3code#28):
+//   GET  /api/orchestration/shell         one read answers exists + busy + path
+//   GET  /api/orchestration/threads/:id   the full transcript, for capture
+//   POST /api/orchestration/dispatch      every command, including spawn
+// The one exception is `server.getConfig`, which has no HTTP route and is the
+// only way to resolve a concrete {instanceId, model} for thread.create. It costs
+// roughly two seconds, so it is a spawn-time call and its answer is cached.
+//
+// Credential: `Authorization: Bearer <token>` and nothing else. A `?token=`
+// query parameter is refused by the server. Mint one with
+//   t3 auth session issue --token-only --ttl 30d
+// and put it in $FM_HOME/config/t3-token.
+//
+// Exit codes, which bin/backends/t3.sh reads as its contract:
+//   0  done
+//   1  transport, credential, or server failure
+//   3  target gone (the thread is archived or deleted)
+//   4  the credential has expired
+//
+// Usage:
+//   fm-t3 capture <thread-id> [lines]
+//   fm-t3 busy <thread-id>
+//   fm-t3 exists <thread-id>
+//   fm-t3 worktree <thread-id>
+//   fm-t3 send <thread-id> <text>
+//   fm-t3 spawn --thread-id <uuid> --project-root <path> --worktree <path>
+//               --title <name> --brief-file <path> [--branch <name>]
+//   fm-t3 kill <thread-id>
+//   fm-t3 purge [--thread <thread-id>] [--project-root <path>]
+//   fm-t3 checkpoint-refs <thread-id>
+//   fm-t3 token-info
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { randomUUID } = require("node:crypto");
+
+const argv = process.argv.slice(2);
+const MODE = argv[0] ?? "";
+const positional = argv.slice(1).filter((entry) => !entry.startsWith("--"));
+
+function flag(name, fallback) {
+  const index = argv.indexOf(`--${name}`);
+  if (index === -1) return fallback;
+  const next = argv[index + 1];
+  return next !== undefined && !next.startsWith("--") ? next : true;
+}
+
+// Callers pipe capture output into `head`/`tail`, which closes the pipe early.
+// Without this a perfectly good capture dies with an unhandled EPIPE.
+process.stdout.on("error", (error) => {
+  if (error.code === "EPIPE") process.exit(0);
+  throw error;
+});
+
+function fail(message, code) {
+  process.stderr.write(`error: ${message}\n`);
+  process.exit(code ?? 1);
+}
+
+// --------------------------------------------------------------- environment
+
+const CODE_ROOT = path.resolve(__dirname, "..");
+const FM_HOME = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || process.env.FM_ROOT || CODE_ROOT;
+const FM_CONFIG = process.env.FM_CONFIG_OVERRIDE || path.join(FM_HOME, "config");
+const T3_HOME = flag("base-dir", process.env.T3CODE_HOME || path.join(os.homedir(), ".t3"));
+
+function discoverOrigin() {
+  const explicit = flag("origin", process.env.FM_T3_ORIGIN || null);
+  if (typeof explicit === "string" && explicit) return explicit.replace(/\/+$/, "");
+  const statePath = path.join(T3_HOME, "userdata", "server-runtime.json");
+  let raw;
+  try {
+    raw = fs.readFileSync(statePath, "utf8");
+  } catch {
+    fail(
+      `no T3 Code server found: ${statePath} is unreadable. Start the T3 Code app, or pass ` +
+        "--origin http://127.0.0.1:3773",
+    );
+  }
+  const origin = JSON.parse(raw).origin;
+  if (!origin) fail(`${statePath} carries no origin`);
+  return String(origin).replace(/\/+$/, "");
+}
+
+function tokenFilePath() {
+  const explicit = flag("token-file", process.env.FM_T3_TOKEN_FILE || null);
+  if (typeof explicit === "string" && explicit) return explicit;
+  return path.join(FM_CONFIG, "t3-token");
+}
+
+function readToken() {
+  const file = tokenFilePath();
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    fail(
+      `no T3 Code bearer token at ${file}. Mint one with ` +
+        "`t3 auth session issue --token-only --ttl 30d` and write it there.",
+      4,
+    );
+  }
+  const token = raw.trim();
+  if (!token) fail(`${file} is empty`, 4);
+  return token;
+}
+
+/**
+ * The session token is `base64url(JSON claims).signature`, so expiry, session id
+ * and scopes decode with no call to anything — no server, no CLI, no database.
+ * That is what makes an expiry pre-flight affordable on every invocation.
+ */
+function decodeClaims(token) {
+  try {
+    return JSON.parse(Buffer.from(token.split(".")[0], "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function assertUnexpired(token) {
+  const claims = decodeClaims(token);
+  if (claims && typeof claims.exp === "number" && claims.exp <= Date.now()) {
+    fail(
+      `the T3 Code session token expired at ${new Date(claims.exp).toISOString()}; mint a new one ` +
+        `into ${tokenFilePath()}`,
+      4,
+    );
+  }
+}
+
+// ------------------------------------------------------------------ transport
+
+function bearer(token) {
+  return { authorization: `Bearer ${token}` };
+}
+
+async function getJson(origin, token, route) {
+  let response;
+  try {
+    response = await fetch(`${origin}${route}`, { headers: bearer(token) });
+  } catch (error) {
+    fail(`cannot reach the T3 Code server at ${origin}: ${error.message}`);
+  }
+  if (response.status === 401 || response.status === 403) {
+    fail(`the T3 Code server refused the bearer token (HTTP ${response.status})`, 4);
+  }
+  const body = await response.text();
+  return { status: response.status, body };
+}
+
+/**
+ * Three failure shapes worth telling apart, because from bash they look alike:
+ *   400 with an EMPTY body  the payload failed schema decode
+ *   400 with a JSON body    the normalizer refused it (invalid_command)
+ *   500                     the shape was fine and the engine refused it
+ * The 500 carries no reason (http.ts flattens every engine failure into one
+ * `orchestration_dispatch_failed`), which is why every guarded command in this
+ * file confirms its outcome by reading the thread back rather than by status.
+ */
+async function dispatch(origin, token, command) {
+  let response;
+  try {
+    response = await fetch(`${origin}/api/orchestration/dispatch`, {
+      method: "POST",
+      headers: { ...bearer(token), "content-type": "application/json" },
+      body: JSON.stringify(command),
+    });
+  } catch (error) {
+    fail(`cannot reach the T3 Code server at ${origin}: ${error.message}`);
+  }
+  const body = await response.text();
+  return { ok: response.ok, status: response.status, body };
+}
+
+/** The one WebSocket path: bearer -> wsTicket -> /ws, then Effect-RPC frames. */
+async function wsRequest(origin, token, tag, payload) {
+  const ticketResponse = await fetch(`${origin}/api/auth/websocket-ticket`, {
+    method: "POST",
+    headers: bearer(token),
+  });
+  if (!ticketResponse.ok) throw new Error(`websocket-ticket ${ticketResponse.status}`);
+  const { ticket } = await ticketResponse.json();
+  const socket = new WebSocket(
+    `${origin.replace(/^http/, "ws")}/ws?wsTicket=${encodeURIComponent(ticket)}`,
+  );
+  try {
+    await new Promise((resolve, reject) => {
+      socket.addEventListener("open", resolve, { once: true });
+      socket.addEventListener("close", (event) => reject(new Error(`closed ${event.code}`)), {
+        once: true,
+      });
+    });
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${tag} timed out after 30s`)), 30_000);
+      socket.addEventListener("message", (event) => {
+        for (const message of [].concat(JSON.parse(event.data))) {
+          if (message._tag !== "Exit" || String(message.requestId) !== "1") continue;
+          clearTimeout(timer);
+          if (message.exit._tag === "Success") resolve(message.exit.value);
+          else reject(new Error(JSON.stringify(message.exit.cause).slice(0, 400)));
+        }
+      });
+      socket.send(JSON.stringify({ _tag: "Request", id: "1", tag, payload, headers: [] }));
+    });
+  } finally {
+    socket.close();
+  }
+}
+
+// --------------------------------------------------------------------- reads
+
+async function fetchShell(origin, token) {
+  const { status, body } = await getJson(origin, token, "/api/orchestration/shell");
+  if (status !== 200) fail(`GET /api/orchestration/shell returned ${status}`);
+  return JSON.parse(body);
+}
+
+/**
+ * The shell read is the cheap one (~150ms against ~2900ms for `snapshot`) and it
+ * is what every polled operation uses. A thread that is archived or deleted is
+ * simply absent from it — the two are indistinguishable over this surface, and
+ * both mean "gone" to a supervisor, so nothing is lost.
+ */
+function findThread(shell, threadId) {
+  return (shell.threads ?? []).find((entry) => entry.id === threadId) ?? null;
+}
+
+async function fetchThread(origin, token, threadId) {
+  const { status, body } = await getJson(
+    origin,
+    token,
+    `/api/orchestration/threads/${encodeURIComponent(threadId)}`,
+  );
+  if (status === 404) return null;
+  if (status !== 200) fail(`GET /api/orchestration/threads/${threadId} returned ${status}`);
+  return JSON.parse(body).thread;
+}
+
+// ------------------------------------------------------------------ rendering
+
+/**
+ * Render a thread into the plain, escape-free `role: text` lines firstmate's
+ * capture contract owes its callers — the same shape claude-bg renders from its
+ * JSONL. Rendering from structured state rather than a terminal buffer makes the
+ * "no raw escape bytes reach firstmate context" guarantee free.
+ *
+ * Messages and tool activities are interleaved by createdAt rather than grouped
+ * by type: capture means "the last N lines", and a thread carries far more
+ * activities than messages, so grouping would make the tail permanently tool
+ * noise and never the recent reply.
+ */
+function renderThread(thread, limit) {
+  const rows = [];
+  for (const message of thread.messages ?? []) {
+    if (message.isStreaming || message.streaming) continue; // partials re-emit
+    for (const line of String(message.text ?? "").split(/\r?\n/)) {
+      const clean = line.replace(/\r/g, "");
+      if (clean.trim()) rows.push({ at: message.createdAt, text: `${message.role}: ${clean}` });
+    }
+  }
+  for (const activity of thread.activities ?? []) {
+    if (!String(activity.kind ?? "").startsWith("tool.")) continue;
+    rows.push({
+      at: activity.createdAt,
+      text: `[${activity.kind}] ${String(activity.summary ?? "").replace(/\r/g, "")}`.trim(),
+    });
+  }
+  rows.sort((a, b) => String(a.at ?? "").localeCompare(String(b.at ?? "")));
+  return rows
+    .slice(-limit)
+    .map((row) => row.text)
+    .join("\n");
+}
+
+/**
+ * The busy-state mapping, computed from one shell entry. The approval and
+ * user-input flags are on the same entry, so `blocked` costs no extra call.
+ *
+ * A clean turn end is `ready`, never `idle` — both map to idle here so a caller
+ * never has to know which. A fresh thread has `session: null` until its first
+ * turn, which is `unknown` rather than an error: the thread exists, it just has
+ * nothing to report yet, and every spawn passes through that state.
+ */
+function deriveBusyState(entry) {
+  if (!entry) return "exited";
+  if (entry.hasPendingApprovals || entry.hasPendingUserInput) return "blocked";
+  const status = entry.session?.status;
+  if (!status) return "unknown";
+  if (status === "starting" || status === "running") return "busy";
+  if (status === "ready" || status === "idle") return "idle";
+  if (status === "stopped" || status === "error" || status === "interrupted") return "exited";
+  return "unknown";
+}
+
+// ------------------------------------------------------------------ commands
+
+const MODEL_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+
+function modelCachePath() {
+  return path.join(FM_CONFIG, "t3-model-cache.json");
+}
+
+/**
+ * Resolve a concrete {instanceId, model} for thread.create.
+ *
+ * `modelSelection` is required (not optional) on thread.create, and
+ * `server.getConfig` is the only place a concrete selection can be derived. It
+ * is an RPC with no HTTP route, so this is the single WebSocket call firstmate
+ * makes against T3 — at spawn only, never on a polled path — and its answer is
+ * cached so repeated spawns do not pay it.
+ */
+async function resolveModelSelection(origin, token) {
+  const cacheFile = modelCachePath();
+  try {
+    const cached = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+    if (cached.origin === origin && Date.now() - cached.at < MODEL_CACHE_TTL_MS) {
+      return cached.modelSelection;
+    }
+  } catch {
+    // no usable cache; fall through to the live call
+  }
+  let config;
+  try {
+    config = await wsRequest(origin, token, "server.getConfig", {});
+  } catch (error) {
+    fail(`could not resolve a T3 model selection: ${error.message}`);
+  }
+  const instances = config.providers?.instances ?? config.providers ?? [];
+  const claude = (Array.isArray(instances) ? instances : []).find(
+    (entry) => entry.driver === "claudeAgent" || entry.instanceId === "claudeAgent",
+  );
+  if (!claude) fail("T3 Code has no claudeAgent provider instance configured");
+  const model = claude.models?.[0]?.slug ?? claude.models?.[0]?.id;
+  if (!model) fail(`T3 Code provider ${claude.instanceId} exposes no models`);
+  const modelSelection = { instanceId: claude.instanceId, model };
+  try {
+    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+    fs.writeFileSync(cacheFile, JSON.stringify({ origin, at: Date.now(), modelSelection }));
+  } catch {
+    // a cache that cannot be written is a slower spawn, not a failure
+  }
+  return modelSelection;
+}
+
+/**
+ * Compare two workspace roots the way Windows does. Separators are folded
+ * because the server stores `C:\a\b` for a root we sent as `C:/a/b`, so a
+ * literal compare would miss the project we ourselves just created.
+ */
+function sameRoot(a, b) {
+  const norm = (v) => String(v).replace(/[\\/]+/g, "/").replace(/\/+$/, "").toLowerCase();
+  return norm(a) === norm(b);
+}
+
+/** The T3 project whose workspaceRoot is <root>, created if there is none. */
+async function ensureProject(origin, token, shell, root) {
+  const existing = (shell.projects ?? []).find((project) => sameRoot(project.workspaceRoot ?? "", root));
+  if (existing) return existing.id;
+  const projectId = randomUUID();
+  const created = await dispatch(origin, token, {
+    type: "project.create",
+    commandId: randomUUID(),
+    projectId,
+    title: path.basename(root.replace(/[\\/]+$/, "")) || "firstmate",
+    workspaceRoot: root,
+    createdAt: new Date().toISOString(),
+  });
+  if (!created.ok) {
+    fail(`project.create for ${root} returned ${created.status}: ${created.body.slice(0, 300)}`);
+  }
+  return projectId;
+}
+
+async function runSpawn() {
+  const threadId = String(flag("thread-id", ""));
+  const projectRoot = String(flag("project-root", ""));
+  const worktree = String(flag("worktree", ""));
+  const title = String(flag("title", `fm-${threadId.slice(0, 8)}`));
+  const briefFile = String(flag("brief-file", ""));
+  const branchFlag = flag("branch", null);
+  if (!threadId || !projectRoot || !worktree || !briefFile) {
+    fail("spawn needs --thread-id, --project-root, --worktree and --brief-file");
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)) {
+    fail(`spawn needs a UUID thread id (got '${threadId}')`);
+  }
+  let brief;
+  try {
+    brief = fs.readFileSync(briefFile, "utf8");
+  } catch {
+    fail(`could not read the brief at ${briefFile}`);
+  }
+  if (!brief.trim()) fail(`the brief at ${briefFile} is empty`);
+
+  const origin = discoverOrigin();
+  const token = readToken();
+  assertUnexpired(token);
+  const shell = await fetchShell(origin, token);
+  if (findThread(shell, threadId)) fail(`T3 thread ${threadId} already exists`);
+
+  const projectId = await ensureProject(origin, token, shell, projectRoot);
+  const modelSelection = await resolveModelSelection(origin, token);
+
+  // branch and worktreePath are NULLABLE but REQUIRED: omitting either makes
+  // thread.create a 400 with an empty body, which is indistinguishable from any
+  // other schema failure. Always send both, explicitly null when unknown.
+  const created = await dispatch(origin, token, {
+    type: "thread.create",
+    commandId: randomUUID(),
+    threadId,
+    projectId,
+    title,
+    modelSelection,
+    runtimeMode: String(flag("runtime-mode", "full-access")),
+    interactionMode: "default",
+    branch: typeof branchFlag === "string" && branchFlag ? branchFlag : null,
+    worktreePath: worktree,
+    createdAt: new Date().toISOString(),
+  });
+  if (!created.ok) {
+    fail(`thread.create returned ${created.status}: ${created.body.slice(0, 300) || "(empty body — schema decode failure)"}`);
+  }
+
+  // Creation and the first prompt are two commands, but one spawn: a thread with
+  // no turn has no session and reads as `unknown` forever, so the brief goes in
+  // here rather than being left to the caller.
+  const started = await dispatch(origin, token, {
+    type: "thread.turn.start",
+    commandId: randomUUID(),
+    threadId,
+    message: { messageId: randomUUID(), role: "user", text: brief, attachments: [] },
+    modelSelection,
+    runtimeMode: String(flag("runtime-mode", "full-access")),
+    interactionMode: "default",
+    createdAt: new Date().toISOString(),
+  });
+  if (!started.ok) {
+    fail(`thread.turn.start returned ${started.status}: ${started.body.slice(0, 300)}`);
+  }
+  process.stdout.write(`${threadId}\n`);
+}
+
+/**
+ * Teardown, in the one order that works: stop the session, THEN archive.
+ * Archiving first silently drops the stop and leaves a running agent with no
+ * thread to reach it through, which is a permanent orphan.
+ *
+ * Neither status code is trusted. An invariant rejection arrives as a reasonless
+ * 500, and on older builds the same mistake arrives as a misleading 200, so the
+ * verdict comes from reading the thread back: absent from the shell is the
+ * intended end state.
+ */
+async function runKill() {
+  const [threadId] = positional;
+  if (!threadId) fail("kill needs a thread id");
+  const origin = discoverOrigin();
+  const token = readToken();
+  const shell = await fetchShell(origin, token);
+  if (!findThread(shell, threadId)) return; // already gone: nothing to do
+
+  await dispatch(origin, token, {
+    type: "thread.session.stop",
+    commandId: randomUUID(),
+    threadId,
+    createdAt: new Date().toISOString(),
+  });
+  await dispatch(origin, token, {
+    type: "thread.archive",
+    commandId: randomUUID(),
+    threadId,
+    archivedAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+  });
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const after = await fetchShell(origin, token);
+    if (!findThread(after, threadId)) return;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  fail(`T3 thread ${threadId} is still live after stop+archive`);
+}
+
+/**
+ * Really delete, rather than archive.
+ *
+ * Teardown deliberately does NOT use this: an archived thread stays readable in
+ * the app, which is the whole point of running crewmates somewhere a human can
+ * look at them afterwards. `purge` exists for the smoke test, which must leave
+ * the developer's live T3 Code install exactly as it found it, and for a captain
+ * who wants a scratch thread genuinely gone.
+ */
+async function runPurge() {
+  const threadId = flag("thread", null);
+  const projectRoot = flag("project-root", null);
+  const origin = discoverOrigin();
+  const token = readToken();
+  if (typeof threadId === "string" && threadId) {
+    await dispatch(origin, token, {
+      type: "thread.delete",
+      commandId: randomUUID(),
+      threadId,
+      force: true,
+    });
+  }
+  if (typeof projectRoot === "string" && projectRoot) {
+    const shell = await fetchShell(origin, token);
+    const project = (shell.projects ?? []).find((entry) =>
+      sameRoot(entry.workspaceRoot ?? "", projectRoot),
+    );
+    if (project) {
+      await dispatch(origin, token, {
+        type: "project.delete",
+        commandId: randomUUID(),
+        projectId: project.id,
+        force: true,
+      });
+    }
+  }
+}
+
+async function runSend() {
+  const [threadId, ...rest] = positional;
+  const text = rest.join(" ");
+  if (!threadId || !text) fail("send needs a thread id and text");
+  const origin = discoverOrigin();
+  const token = readToken();
+  const shell = await fetchShell(origin, token);
+  // An archived thread accepts a turn and drops it on the shipped build, and
+  // refuses with a reasonless 500 on current main. Neither is readable, so the
+  // existence check happens BEFORE the poke rather than after it.
+  if (!findThread(shell, threadId)) {
+    fail(`T3 thread ${threadId} is gone (archived or deleted); refusing to send into it`, 3);
+  }
+  const started = await dispatch(origin, token, {
+    type: "thread.turn.start",
+    commandId: randomUUID(),
+    threadId,
+    message: { messageId: randomUUID(), role: "user", text, attachments: [] },
+    // Both modes are required on the client turn-start command; omitting either
+    // is a 400 with an empty body. modelSelection, by contrast, is optional here.
+    runtimeMode: String(flag("runtime-mode", "full-access")),
+    interactionMode: "default",
+    createdAt: new Date().toISOString(),
+  });
+  if (!started.ok) {
+    fail(`thread.turn.start returned ${started.status}: ${started.body.slice(0, 300)}`);
+  }
+  // No verdict word is printed here on purpose: the exit code is the contract,
+  // and bin/backends/t3.sh prints the literal `empty` firstmate requires.
+}
+
+async function runCapture() {
+  const [threadId, linesArg] = positional;
+  if (!threadId) fail("capture needs a thread id");
+  const origin = discoverOrigin();
+  const token = readToken();
+  const thread = await fetchThread(origin, token, threadId);
+  if (!thread) fail(`T3 thread ${threadId} not found (archived or deleted)`, 3);
+  process.stdout.write(`${renderThread(thread, Number(linesArg ?? 40) || 40)}\n`);
+}
+
+async function runBusy() {
+  const [threadId] = positional;
+  if (!threadId) fail("busy needs a thread id");
+  const origin = discoverOrigin();
+  const token = readToken();
+  const shell = await fetchShell(origin, token);
+  process.stdout.write(deriveBusyState(findThread(shell, threadId)));
+}
+
+async function runExists() {
+  const [threadId] = positional;
+  if (!threadId) fail("exists needs a thread id");
+  const origin = discoverOrigin();
+  const token = readToken();
+  const shell = await fetchShell(origin, token);
+  process.exit(findThread(shell, threadId) ? 0 : 1);
+}
+
+async function runWorktree() {
+  const [threadId] = positional;
+  if (!threadId) fail("worktree needs a thread id");
+  const origin = discoverOrigin();
+  const token = readToken();
+  const shell = await fetchShell(origin, token);
+  const entry = findThread(shell, threadId);
+  if (!entry) process.exit(3);
+  process.stdout.write(`${entry.worktreePath ?? ""}\n`);
+}
+
+/**
+ * The checkpoint ref namespace T3 writes for <thread-id>.
+ *
+ * T3 pins every turn with a hidden ref in the project's COMMON ref store — the
+ * primary checkout's, not the worktree's — and each one holds a snapshot of the
+ * crewmate's entire working tree, committed or not. Only `thread.delete` sweeps
+ * them, and firstmate's teardown archives rather than deletes, so the sweep is
+ * firstmate's job. Printing the prefix rather than doing the deletion here keeps
+ * the git work in fm-teardown.sh, where the project path is already resolved.
+ */
+function runCheckpointRefs() {
+  const [threadId] = positional;
+  if (!threadId) fail("checkpoint-refs needs a thread id");
+  process.stdout.write(`refs/t3/checkpoints/${Buffer.from(threadId, "utf8").toString("base64url")}\n`);
+}
+
+function runTokenInfo() {
+  const token = readToken();
+  const claims = decodeClaims(token);
+  if (!claims) fail(`the token at ${tokenFilePath()} is not a T3 session token`, 4);
+  const remainingDays = (claims.exp - Date.now()) / 86_400_000;
+  process.stdout.write(
+    [
+      `token_file=${tokenFilePath()}`,
+      `session_id=${claims.sid}`,
+      `subject=${claims.sub}`,
+      `expires_at=${new Date(claims.exp).toISOString()}`,
+      `expires_in_days=${remainingDays.toFixed(2)}`,
+      `scopes=${(claims.scopes ?? []).join(",")}`,
+      "",
+    ].join("\n"),
+  );
+  if (remainingDays <= 0) process.exit(4);
+}
+
+// ----------------------------------------------------------------- dispatch
+
+async function main() {
+  switch (MODE) {
+    case "capture":
+      return runCapture();
+    case "busy":
+      return runBusy();
+    case "exists":
+      return runExists();
+    case "worktree":
+      return runWorktree();
+    case "send":
+      return runSend();
+    case "spawn":
+      return runSpawn();
+    case "kill":
+      return runKill();
+    case "purge":
+      return runPurge();
+    case "checkpoint-refs":
+      return runCheckpointRefs();
+    case "token-info":
+      return runTokenInfo();
+    default:
+      process.stderr.write(
+        "usage: fm-t3 <capture|busy|exists|worktree|send|spawn|kill|purge|checkpoint-refs|token-info> ...\n",
+      );
+      process.exit(2);
+  }
+}
+
+main().catch((error) => {
+  process.stderr.write(`error: ${error.message}\n`);
+  process.exit(1);
+});
