@@ -28,6 +28,9 @@
 # firstmate's vocabulary on top of it, so the words `empty`, `send-failed`,
 # `busy`, `blocked`, `idle`, `exited` and `unknown` are produced HERE and never
 # travel over the wire.
+#
+# shellcheck source=bin/fm-composer-lib.sh
+. "$FM_BACKEND_LIB_DIR/fm-composer-lib.sh"
 
 FM_T3_NODE="${FM_T3_NODE:-node}"
 FM_T3_HELPER="${FM_T3_HELPER:-$FM_BACKEND_LIB_DIR/fm-t3}"
