@@ -5,29 +5,49 @@
 #
 # Like cmux there is no isolated throwaway instance to spin up - T3 Code is one
 # shared, GUI-first application holding the developer's real work. So this test
-# creates ONLY its own scratch git repo and its own project rooted there; it
-# never enumerates-and-closes, never touches a thread it did not create, and
-# purges everything it made on the way out. A crash mid-run leaves at most a
-# couple of archived `fm-test-t3-*`/`fm-t3spawn*` threads in a scratch project.
+# clones its own scratch project from a persistent GitHub repo (see below) into
+# a disposable local checkout; it never enumerates-and-closes, never touches a
+# thread it did not create, and purges everything it made on the way out. A
+# crash mid-run leaves at most a couple of archived `fm-test-t3-*`/`fm-t3spawn*`
+# threads in a scratch project.
 #
-# Two threads get created. The first drives the t3 arm primitives directly
+# Four threads get created. The first drives the t3 arm primitives directly
 # (bin/backends/t3.sh, bin/fm-t3) - the low-level surface. The second goes
 # through the real bin/fm-spawn.sh, bin/fm-send.sh and bin/fm-teardown.sh -
 # a real treehouse worktree lease, a real brief as the crewmate's first
 # prompt, a second turn via the send path, and a real teardown - because that
 # is the path firstmate's crew actually runs, and driving the arms alone never
-# proves it.
+# proves it. The third and fourth are issue #55's live bridge proof: a
+# direct-PR crewmate that pushes a branch and opens a real PR through
+# bin/fm-gh-axi - proving node, npx and the bridge all resolve inside a T3
+# thread - and reports the URL through the status file, never the thread, and
+# a local-only crewmate proving the reverse state on the same real remote:
+# given the same tools, told not to push, it never does.
 #
-# It runs REAL turns against a REAL model, so it costs tokens and a couple of
+# The GitHub side of that proof runs against ONE persistent private scratch
+# repo, autoprintworks/fm-t3-adapter-smoke, created once by hand and never
+# recreated or deleted. This test only ever creates and removes its own
+# per-run branch (fm/<task-id>) and PR on that repo, so it never needs the gh
+# CLI's delete_repo scope. See "Setup, once" below.
+#
+# It runs REAL turns against a REAL model, so it costs tokens and a handful of
 # minutes. Skips cleanly when the T3 Code server is not running, no bearer
-# token is installed, or treehouse is missing, so CI and machines without
-# T3 Code are unaffected.
+# token is installed, treehouse is missing, or gh is missing or not logged in,
+# so CI and machines without T3 Code are unaffected. Every branch and PR this
+# run opens on the persistent scratch repo is closed/deleted on the way out
+# and that cleanup is verified; a crash mid-run leaves at most one open PR and
+# its `fm/<task-id>` branch on autoprintworks/fm-t3-adapter-smoke to close by
+# hand - never a new repo.
 #
 # Setup, once:
 #   t3 auth session issue --token-only --ttl 30d > config/t3-token
+#   gh auth login   (needs repo scope; used only for the #55 checks below)
+#   gh repo create autoprintworks/fm-t3-adapter-smoke --private   (one time, never repeated)
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GH_REPO="autoprintworks/fm-t3-adapter-smoke"
+GH_REMOTE="https://github.com/$GH_REPO.git"
 
 fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
@@ -49,6 +69,10 @@ case $? in
 esac
 command -v treehouse >/dev/null 2>&1 \
   || { echo "skip: treehouse not found (required by fm-spawn.sh)"; exit 0; }
+if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+  echo "skip: gh not found or not logged in (required by the #55 GitHub-bridge checks)"
+  exit 0
+fi
 
 # fm-spawn.sh, fm-send.sh and fm-teardown.sh all refuse to run for a gate agent
 # unless this test-harness escape hatch is set; see bin/fm-gate-refuse-lib.sh.
@@ -59,6 +83,12 @@ PROJ="$TMP_ROOT/proj"
 THREAD=""
 SP_THREAD=""
 SP_WT=""
+BR_THREAD=""
+BR_WT=""
+BR_ID=""
+LO_THREAD=""
+LO_WT=""
+LO_ID=""
 
 cleanup_all() {
   if [ -n "$SP_THREAD" ]; then
@@ -69,9 +99,34 @@ cleanup_all() {
   if [ -n "$SP_WT" ] && command -v treehouse >/dev/null 2>&1; then
     ( cd "$PROJ" && treehouse return --force "$SP_WT" ) >/dev/null 2>&1 || true
   fi
+  if [ -n "$BR_THREAD" ]; then
+    fm_backend_t3_kill "$BR_THREAD" >/dev/null 2>&1 || true
+    fm_backend_t3_sweep_checkpoint_refs "$BR_THREAD" "$PROJ" >/dev/null 2>&1 || true
+    node "$ROOT/bin/fm-t3" purge --thread "$BR_THREAD" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$BR_WT" ] && command -v treehouse >/dev/null 2>&1; then
+    ( cd "$PROJ" && treehouse return --force "$BR_WT" ) >/dev/null 2>&1 || true
+  fi
+  if [ -n "$LO_THREAD" ]; then
+    fm_backend_t3_kill "$LO_THREAD" >/dev/null 2>&1 || true
+    fm_backend_t3_sweep_checkpoint_refs "$LO_THREAD" "$PROJ" >/dev/null 2>&1 || true
+    node "$ROOT/bin/fm-t3" purge --thread "$LO_THREAD" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$LO_WT" ] && command -v treehouse >/dev/null 2>&1; then
+    ( cd "$PROJ" && treehouse return --force "$LO_WT" ) >/dev/null 2>&1 || true
+  fi
   if [ -n "$THREAD" ]; then
     node "$ROOT/bin/fm-t3" purge --thread "$THREAD" --project-root "$(fm_backend_t3_native_path "$PROJ")" \
       >/dev/null 2>&1 || true
+  fi
+  # Best-effort: if a failure struck before the BR/LO sections closed their own
+  # PR and deleted their own branch, remove them from the persistent scratch
+  # repo here rather than leaving them behind. A no-op when already clean.
+  if [ -n "$BR_ID" ]; then
+    git push "$GH_REMOTE" --delete "fm/$BR_ID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$LO_ID" ]; then
+    git push "$GH_REMOTE" --delete "fm/$LO_ID" >/dev/null 2>&1 || true
   fi
   rm -rf "$TMP_ROOT" 2>/dev/null || true
 }
@@ -79,12 +134,10 @@ trap cleanup_all EXIT
 
 # --- fixture -----------------------------------------------------------------
 
-mkdir -p "$PROJ" || exit 1
-git -C "$PROJ" init -q -b main >/dev/null 2>&1 || fail "could not init the scratch repo"
-printf 'scratch project for the t3 adapter smoke test\n' > "$PROJ/README.md"
-git -C "$PROJ" add -A >/dev/null 2>&1
-git -C "$PROJ" -c user.email=smoke@firstmate.local -c user.name='firstmate smoke' \
-  commit -qm 'scratch' >/dev/null 2>&1 || fail "could not commit the scratch repo"
+git clone -q "$GH_REMOTE" "$PROJ" >/dev/null 2>&1 \
+  || fail "could not clone the persistent scratch repo $GH_REPO"
+git -C "$PROJ" config user.email smoke@firstmate.local
+git -C "$PROJ" config user.name 'firstmate smoke'
 
 MARKER="firstmate-t3-smoke-$$"
 BRIEF="$TMP_ROOT/brief.txt"
@@ -377,6 +430,200 @@ SP_WT=
 # (not just t3) refuses teardown of an id with no meta, on purpose, so a typo'd
 # id fails loudly instead of silently doing nothing.
 
+# --- #55: the GitHub bridge resolves inside a t3 thread, reported via the ---
+# --- status file, and the reverse state (local-only) never pushes or PRs. --
+#
+# The persistent scratch repo (autoprintworks/fm-t3-adapter-smoke, cloned
+# into $PROJ above) backs both checks below: a direct-PR crewmate that proves
+# bin/fm-gh-axi (and the node/npx it depends on) resolve inside a T3 thread
+# by actually pushing a branch and opening a PR, and a local-only crewmate
+# proving the opposite - given the same tools, told not to push, it never
+# does. Both report through the status file, never the thread; bin/fm-brief.sh
+# (not hand-written brief text) supplies the mode-specific done-line contract
+# so this test never duplicates it.
+
+PROJ_NAME=$(basename "$PROJ")
+
+# --- direct-PR: the bridge resolves inside the thread and reports via the file
+
+BR_ID="t3bridge$$"
+BR_STATE="$TMP_ROOT/bridge-state"
+BR_DATA="$TMP_ROOT/bridge-data"
+mkdir -p "$BR_STATE" "$BR_DATA/$BR_ID" || fail "could not create the bridge fixture dirs"
+
+# No data/projects.md in this data dir: fm-project-mode.sh defaults an
+# unregistered project to direct-PR, exactly the mode this check needs.
+BR_MARKER="firstmate-t3-bridge-smoke-$$"
+FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$BR_STATE" FM_DATA_OVERRIDE="$BR_DATA" \
+  "$ROOT/bin/fm-brief.sh" "$BR_ID" "$PROJ_NAME" >/dev/null \
+  || fail "fm-brief.sh failed to scaffold the direct-PR brief"
+BR_BRIEF="$BR_DATA/$BR_ID/brief.md"
+grep -q 'done: PR {url}' "$BR_BRIEF" || fail "the scaffolded brief lost the direct-PR done-line contract"
+cat >> "$BR_BRIEF" <<EOF
+
+# Test task
+Create a new file named bridge-proof.txt containing exactly this one line:
+$BR_MARKER
+Stage and commit it with message "bridge smoke: $BR_MARKER".
+Push your branch to origin, then open a pull request from your branch into
+main using Firstmate's hidden-window GitHub bridge, titled "bridge smoke:
+$BR_MARKER" with an empty body. Make no other changes.
+EOF
+
+BR_SPAWN_OUT="$TMP_ROOT/bridge-spawn.out"; BR_SPAWN_ERR="$TMP_ROOT/bridge-spawn.err"
+env -u TMUX -u FM_BACKEND PATH="$PATH" \
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$BR_STATE" FM_DATA_OVERRIDE="$BR_DATA" \
+  FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" \
+  "$ROOT/bin/fm-spawn.sh" "$BR_ID" "$PROJ" --backend t3 --harness claude \
+  >"$BR_SPAWN_OUT" 2>"$BR_SPAWN_ERR"
+status=$?
+[ "$status" -eq 0 ] \
+  || fail "fm-spawn.sh failed for $BR_ID"$'\n'"$(cat "$BR_SPAWN_OUT")"$'\n'"$(cat "$BR_SPAWN_ERR")"
+
+BR_META="$BR_STATE/$BR_ID.meta"
+BR_THREAD=$(grep '^t3_thread=' "$BR_META" | cut -d= -f2-)
+BR_WT=$(grep '^worktree=' "$BR_META" | cut -d= -f2-)
+[ -n "$BR_THREAD" ] && [ -n "$BR_WT" ] || fail "fm-spawn.sh meta is missing a thread or worktree for $BR_ID"
+
+for _ in $(seq 1 480); do
+  case "$(fm_backend_t3_busy_state "$BR_THREAD")" in
+    idle|exited) break ;;
+  esac
+  sleep 1
+done
+[ "$(fm_backend_t3_busy_state "$BR_THREAD")" = idle ] \
+  || fail "the direct-PR crewmate's turn did not settle to idle"
+
+BR_STATUS_FILE="$BR_STATE/$BR_ID.status"
+[ -f "$BR_STATUS_FILE" ] || fail "the direct-PR crewmate never wrote a status file"
+BR_DONE_LINE=$(grep '^done: PR ' "$BR_STATUS_FILE" | tail -1) \
+  || fail "the status file has no 'done: PR <url>' line"$'\n'"$(cat "$BR_STATUS_FILE")"
+BR_PR_URL=${BR_DONE_LINE#done: PR }
+case "$BR_PR_URL" in
+  "https://github.com/$GH_REPO/pull/"*) ;;
+  *) fail "the reported PR URL is not a pull request on the scratch repo (got '$BR_PR_URL')" ;;
+esac
+pass "the direct-PR crewmate resolves node, npx and the bridge, and reports the PR URL through the status file"
+
+BR_CAP=$(fm_backend_t3_capture "$BR_THREAD" 200) || fail "capture failed for the bridge thread"
+case "$BR_CAP" in
+  *"$BR_MARKER"*) ;;
+  *) fail "the bridge thread's own transcript is missing the task marker (sanity check)" ;;
+esac
+
+BR_PR_STATE=$(gh pr view "$BR_PR_URL" --json state -q .state 2>/dev/null) \
+  || fail "gh could not read back the reported PR; the bridge did not really open one"
+[ "$BR_PR_STATE" = OPEN ] || fail "the reported PR is not open on GitHub (state=$BR_PR_STATE)"
+BR_PR_HEAD=$(gh pr view "$BR_PR_URL" --json headRefName -q .headRefName 2>/dev/null)
+[ "$BR_PR_HEAD" = "fm/$BR_ID" ] \
+  || fail "the reported PR's head branch is not fm/$BR_ID (got '$BR_PR_HEAD')"
+pass "the reported PR URL is a real, open pull request on the scratch repo, from the crewmate's own branch"
+
+BR_TEARDOWN_OUT="$TMP_ROOT/bridge-teardown.out"
+FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$BR_STATE" FM_DATA_OVERRIDE="$BR_DATA" \
+  "$ROOT/bin/fm-teardown.sh" "$BR_ID" >"$BR_TEARDOWN_OUT" 2>&1
+status=$?
+[ "$status" -eq 0 ] || fail "fm-teardown.sh failed for $BR_ID"$'\n'"$(cat "$BR_TEARDOWN_OUT")"
+BR_WT=
+pass "fm-teardown.sh tears down the direct-PR crewmate"
+
+gh pr close "$BR_PR_URL" --delete-branch </dev/null >/dev/null 2>&1 \
+  || fail "could not close the scratch PR"
+BR_PR_STATE_AFTER=$(gh pr view "$BR_PR_URL" --json state -q .state 2>/dev/null)
+[ "$BR_PR_STATE_AFTER" = CLOSED ] || fail "the scratch PR did not close (state=$BR_PR_STATE_AFTER)"
+pass "the scratch PR is closed and its branch deleted, verified by reading GitHub back"
+
+# --- local-only: the same crewmate, told not to push, never does ------------
+
+LO_ID="t3local$$"
+LO_STATE="$TMP_ROOT/local-state"
+LO_DATA="$TMP_ROOT/local-data"
+mkdir -p "$LO_STATE" "$LO_DATA/$LO_ID" || fail "could not create the local-only fixture dirs"
+
+# A data/projects.md scoped to this thread's own data dir registers the same
+# project as local-only, without touching the direct-PR thread's own mode.
+printf -- '- %s [local-only] - local-only reverse-state fixture (added 2026-08-05)\n' \
+  "$PROJ_NAME" > "$LO_DATA/projects.md"
+
+LO_MARKER="firstmate-t3-local-smoke-$$"
+FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$LO_STATE" FM_DATA_OVERRIDE="$LO_DATA" \
+  "$ROOT/bin/fm-brief.sh" "$LO_ID" "$PROJ_NAME" >/dev/null \
+  || fail "fm-brief.sh failed to scaffold the local-only brief"
+LO_BRIEF="$LO_DATA/$LO_ID/brief.md"
+grep -q "done: ready in branch fm/$LO_ID" "$LO_BRIEF" \
+  || fail "the scaffolded brief lost the local-only done-line contract"
+grep -q 'Never push to any remote and never open a PR' "$LO_BRIEF" \
+  || fail "the scaffolded brief lost the local-only never-push rule"
+cat >> "$LO_BRIEF" <<EOF
+
+# Test task
+Create a new file named local-proof.txt containing exactly this one line:
+$LO_MARKER
+Stage and commit it with message "local smoke: $LO_MARKER". Make no other
+changes, and do not touch any remote.
+EOF
+
+LO_SPAWN_OUT="$TMP_ROOT/local-spawn.out"; LO_SPAWN_ERR="$TMP_ROOT/local-spawn.err"
+env -u TMUX -u FM_BACKEND PATH="$PATH" \
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$LO_STATE" FM_DATA_OVERRIDE="$LO_DATA" \
+  FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" \
+  "$ROOT/bin/fm-spawn.sh" "$LO_ID" "$PROJ" --backend t3 --harness claude \
+  >"$LO_SPAWN_OUT" 2>"$LO_SPAWN_ERR"
+status=$?
+[ "$status" -eq 0 ] \
+  || fail "fm-spawn.sh failed for $LO_ID"$'\n'"$(cat "$LO_SPAWN_OUT")"$'\n'"$(cat "$LO_SPAWN_ERR")"
+
+LO_META="$LO_STATE/$LO_ID.meta"
+LO_THREAD=$(grep '^t3_thread=' "$LO_META" | cut -d= -f2-)
+LO_WT=$(grep '^worktree=' "$LO_META" | cut -d= -f2-)
+[ -n "$LO_THREAD" ] && [ -n "$LO_WT" ] || fail "fm-spawn.sh meta is missing a thread or worktree for $LO_ID"
+
+for _ in $(seq 1 480); do
+  case "$(fm_backend_t3_busy_state "$LO_THREAD")" in
+    idle|exited) break ;;
+  esac
+  sleep 1
+done
+[ "$(fm_backend_t3_busy_state "$LO_THREAD")" = idle ] \
+  || fail "the local-only crewmate's turn did not settle to idle"
+
+LO_STATUS_FILE="$LO_STATE/$LO_ID.status"
+[ -f "$LO_STATUS_FILE" ] || fail "the local-only crewmate never wrote a status file"
+grep -q "^done: ready in branch fm/$LO_ID\$" "$LO_STATUS_FILE" \
+  || fail "the status file has no 'done: ready in branch fm/$LO_ID' line"$'\n'"$(cat "$LO_STATUS_FILE")"
+grep -qi 'PR ' "$LO_STATUS_FILE" && fail "the local-only status file mentions a PR; it must never open one"
+pass "the local-only crewmate reports the reverse state through the status file: ready, no PR"
+
+git ls-remote "$GH_REMOTE" "refs/heads/fm/$LO_ID" > "$TMP_ROOT/lo-remote-check.out" 2>/dev/null
+[ -s "$TMP_ROOT/lo-remote-check.out" ] \
+  && fail "the local-only crewmate's branch reached the real remote; it must never push"
+gh pr list --repo "$GH_REPO" --head "fm/$LO_ID" --json url -q '.[].url' \
+  > "$TMP_ROOT/lo-pr-check.out" 2>/dev/null
+[ -s "$TMP_ROOT/lo-pr-check.out" ] \
+  && fail "the local-only crewmate opened a PR; it must never open one"
+pass "no push and no PR reached the real remote for the local-only crewmate, verified by reading GitHub back"
+
+# The captain's merge authority approves and lands the ready branch before
+# teardown - fm-teardown.sh correctly refuses an unmerged local-only worktree,
+# so this step is not optional (bin/fm-merge-local.sh is the guarded
+# fast-forward path; see its header comment).
+LO_MERGE_OUT="$TMP_ROOT/local-merge.out"
+FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$LO_STATE" FM_DATA_OVERRIDE="$LO_DATA" \
+  "$ROOT/bin/fm-merge-local.sh" "$LO_ID" >"$LO_MERGE_OUT" 2>&1
+status=$?
+[ "$status" -eq 0 ] || fail "fm-merge-local.sh failed for $LO_ID"$'\n'"$(cat "$LO_MERGE_OUT")"
+git -C "$PROJ" log -1 --format=%s | grep -q "local smoke: $LO_MARKER" \
+  || fail "local main does not carry the local-only crewmate's commit after the merge"
+pass "fm-merge-local.sh fast-forwards local main to the approved local-only branch"
+
+LO_TEARDOWN_OUT="$TMP_ROOT/local-teardown.out"
+FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$LO_STATE" FM_DATA_OVERRIDE="$LO_DATA" \
+  "$ROOT/bin/fm-teardown.sh" "$LO_ID" >"$LO_TEARDOWN_OUT" 2>&1
+status=$?
+[ "$status" -eq 0 ] || fail "fm-teardown.sh failed for $LO_ID"$'\n'"$(cat "$LO_TEARDOWN_OUT")"
+LO_WT=
+pass "fm-teardown.sh tears down the local-only crewmate"
+
 # --- purge everything this run created, verified by reading the server -----
 #
 # The captain's own T3 projects and threads are untouched by construction:
@@ -385,6 +632,8 @@ SP_WT=
 
 VERIFY_THREAD="$THREAD"
 VERIFY_SP_THREAD="$SP_THREAD"
+VERIFY_BR_THREAD="$BR_THREAD"
+VERIFY_LO_THREAD="$LO_THREAD"
 if ! cleanup_all; then
   trap - EXIT
   fail "cleanup failed to purge the scratch project and threads"
@@ -393,6 +642,10 @@ trap - EXIT
 THREAD=""
 SP_THREAD=""
 SP_WT=""
+BR_THREAD=""
+BR_WT=""
+LO_THREAD=""
+LO_WT=""
 
 node "$ROOT/bin/fm-t3" exists "$VERIFY_THREAD" >/dev/null 2>&1
 status=$?
@@ -402,6 +655,26 @@ node "$ROOT/bin/fm-t3" exists "$VERIFY_SP_THREAD" >/dev/null 2>&1
 status=$?
 [ "$status" -eq 1 ] || fail "the spawned scratch thread is still visible to the server after purge (exit=$status)"
 
-pass "the scratch project and both threads are purged, verified by reading the server afterwards"
+node "$ROOT/bin/fm-t3" exists "$VERIFY_BR_THREAD" >/dev/null 2>&1
+status=$?
+[ "$status" -eq 1 ] || fail "the direct-PR scratch thread is still visible to the server after purge (exit=$status)"
+
+node "$ROOT/bin/fm-t3" exists "$VERIFY_LO_THREAD" >/dev/null 2>&1
+status=$?
+[ "$status" -eq 1 ] || fail "the local-only scratch thread is still visible to the server after purge (exit=$status)"
+
+pass "the scratch project and all four threads are purged, verified by reading the server afterwards"
+
+# cleanup_all above already removed $TMP_ROOT, so these two checks capture
+# into variables rather than files.
+FINAL_BR_REMOTE=$(git ls-remote "$GH_REMOTE" "refs/heads/fm/$BR_ID" 2>/dev/null)
+[ -z "$FINAL_BR_REMOTE" ] \
+  || fail "the direct-PR crewmate's branch is still on the persistent scratch repo after cleanup"
+FINAL_LO_REMOTE=$(git ls-remote "$GH_REMOTE" "refs/heads/fm/$LO_ID" 2>/dev/null)
+[ -z "$FINAL_LO_REMOTE" ] \
+  || fail "the local-only crewmate's branch reached the persistent scratch repo"
+BR_ID=""
+LO_ID=""
+pass "no branch from this run remains on the persistent scratch repo, verified by reading GitHub back"
 
 echo "# all t3 adapter smoke checks passed"
