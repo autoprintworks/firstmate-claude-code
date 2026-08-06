@@ -228,6 +228,47 @@ EOF
 # Archived and deleted threads are indistinguishable over this surface — both are
 # simply absent — and both are correctly read as "gone": an archived thread
 # swallows turns silently, so treating it as live would strand the supervisor.
-fm_backend_t3_target_exists() {  # <thread-id>
-  fm_backend_t3_helper exists "$1" >/dev/null 2>&1
+#
+# [expected-worktree], when given, adds one more way to read "gone": a thread
+# whose worktree no longer matches the one firstmate leased for it. That
+# worktree can vanish or get re-pointed entirely outside firstmate's control —
+# `treehouse return`, a human reusing the lease, a rebase tool moving it — and a
+# thread aimed at the wrong tree is not a live crewmate, it is a stale address.
+# Reading it as gone (rather than idle) is deliberate: nothing here repairs or
+# re-adopts the mismatch, it only stops the supervisor from mistaking it for a
+# working endpoint. Omit the argument for the cheap existence-only read every
+# other caller uses; the extra info round-trip only runs when a caller asks for
+# the identity check too.
+fm_backend_t3_target_exists() {  # <thread-id> [expected-worktree]
+  local id=$1 expected=${2:-} live
+  if [ -z "$expected" ]; then
+    fm_backend_t3_helper exists "$id" >/dev/null 2>&1
+    return $?
+  fi
+  live=$(fm_backend_t3_helper info "$id" 2>/dev/null | sed -n 's/^worktree=//p') || return 1
+  [ -n "$live" ] || return 1
+  [ "$live" = "$expected" ]
+}
+
+# fm_backend_t3_identity_status: has a human touched this thread's identity
+# since firstmate spawned it? Prints exactly one of:
+#   ok          - the live title still matches <expected-title>
+#   renamed:X   - the live title is now X
+#   gone        - the thread cannot be read at all (existence is
+#                 fm_backend_t3_target_exists's job; callers check that first)
+#
+# firstmate never supplies titleSeed on the create call, so the T3 server's
+# canReplaceThreadTitle guard refuses every rename EXCEPT one a human makes
+# directly in the app. A title change is therefore proof of a human hand on the
+# thread, not ambiguous signal needing corroboration - the caller can treat
+# `renamed:` as a one-way captain-held transfer without a second check.
+fm_backend_t3_identity_status() {  # <thread-id> <expected-title>
+  local id=$1 expected=$2 live
+  live=$(fm_backend_t3_helper info "$id" 2>/dev/null | sed -n 's/^title=//p') || { printf 'gone'; return 0; }
+  [ -n "$live" ] || { printf 'gone'; return 0; }
+  if [ "$live" = "$expected" ]; then
+    printf 'ok'
+  else
+    printf 'renamed:%s' "$live"
+  fi
 }

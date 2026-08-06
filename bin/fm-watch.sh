@@ -878,6 +878,40 @@ EOF
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue
     fi
+    # T3-only: a thread's worktree can be re-pointed entirely outside
+    # firstmate's control (a human reusing the lease, a rebase tool moving the
+    # tree). That reads as gone, not idle - nothing here repairs or re-adopts
+    # the mismatch, the watcher just stops mistaking it for a live crewmate.
+    if [ "$(window_backend "$w")" = t3 ]; then
+      fm_backend_source t3 2>/dev/null || true
+      t3_expected_wt=$(grep '^worktree=' "$STATE/$task.meta" 2>/dev/null | cut -d= -f2-)
+      # state/<id>.meta records the worktree in whatever form fm-spawn.sh held
+      # it in (a Git Bash path on Windows); the server always stores and hands
+      # back the native form (see fm_backend_t3_create_task). Compare like with
+      # like, or every t3 window misreads as re-pointed on the very first poll.
+      if [ -n "$t3_expected_wt" ] \
+        && ! fm_backend_target_exists_at t3 "$w" "$(fm_backend_t3_native_path "$t3_expected_wt")"; then
+        continue
+      fi
+      # A rename away from fm-<id> is proof of a human hand on the thread (see
+      # fm_backend_t3_identity_status): infer captain-held once, then leave the
+      # window alone entirely for as long as that status stands. One-way -
+      # restoring the original title never clears it, so this only runs while
+      # the last status line is not already captain-held.
+      if [ "$(status_line_verb "$last")" != "${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}" ]; then
+        t3_identity=$(fm_backend_identity_status t3 "$w" "$(window_label "$w")" 2>/dev/null) || t3_identity=ok
+        case "$t3_identity" in
+          renamed:*)
+            printf 'captain-held: t3 thread renamed to "%s" (spawned as %s)\n' \
+              "${t3_identity#renamed:}" "$(window_label "$w")" >> "$STATE/$task.status"
+            last=$(last_status_line "$STATE/$task.status")
+            ;;
+        esac
+      fi
+      if status_is_paused_or_captain_held "$last"; then
+        continue
+      fi
+    fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
     key=$(printf '%s' "$w" | tr ':/.' '___')

@@ -580,6 +580,11 @@ case "$mode" in
   kill) [ -z "${FM_T3_FAKE_KILL_FAIL:-}" ] || exit 1; exit 0 ;;
   checkpoint-refs) printf 'refs/t3/checkpoints/%s/\n' "${2:-unknown}" ;;
   exists) [ -z "${FM_T3_FAKE_MISSING:-}" ] || exit 1; exit 0 ;;
+  info)
+    [ -z "${FM_T3_FAKE_MISSING:-}" ] || exit 1
+    printf 'title=%s\n' "${FM_T3_FAKE_TITLE:-fm-thread-1}"
+    printf 'worktree=%s\n' "${FM_T3_FAKE_INFO_WORKTREE:-/fake/worktree}"
+    ;;
   *) exit 1 ;;
 esac
 SH
@@ -624,6 +629,77 @@ test_backend_t3_required_tools_and_dispatch() {
   assert_not_contains "$(cat "$log")" $'fm-t3\x1fkey' "send_key Enter should not call the t3 helper at all"
 
   pass "t3: required tools are node+treehouse and every generic dispatcher resolves to the t3 adapter"
+}
+
+test_t3_target_exists_reads_worktree_drift_as_gone() {
+  local dir fake log
+  dir=$TMP_ROOT/t3-drift
+  fake=$(make_t3_fakebin "$dir")
+  log="$dir/t3.log"
+  : > "$log"
+
+  FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" FM_T3_FAKE_INFO_WORKTREE=/leased/tree \
+    fm_backend_target_exists_at t3 thread-1 /leased/tree \
+    || fail "a matching worktree should still read as existing"
+
+  FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" FM_T3_FAKE_INFO_WORKTREE=/leased/tree \
+    fm_backend_target_exists_at t3 thread-1 /other/tree \
+    && fail "a re-pointed worktree should read as gone, not idle"
+
+  FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" FM_T3_FAKE_MISSING=1 \
+    fm_backend_target_exists_at t3 thread-1 /leased/tree \
+    && fail "a thread that cannot be read at all should read as gone"
+
+  # No expected-worktree given: unchanged, cheap existence-only read, no info call.
+  : > "$log"
+  FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" fm_backend_t3_target_exists thread-1 \
+    || fail "the existence-only form (no expected-worktree) should still pass"
+  assert_not_contains "$(cat "$log")" $'fm-t3\x1finfo' \
+    "the existence-only form must not pay for the extra info round-trip"
+
+  # A non-t3 backend has no worktree concept: falls back to the plain existence read.
+  fm_backend_target_exists() { [ "$1" = tmux ] && [ "$2" = w1 ]; }
+  fm_backend_target_exists_at tmux w1 /irrelevant \
+    || fail "a backend with no drift concept should fall back to fm_backend_target_exists"
+  unset -f fm_backend_target_exists
+
+  pass "fm_backend_target_exists_at: t3 worktree drift and a fully unreadable thread both read as gone; other backends fall back unchanged"
+}
+
+test_t3_identity_status_detects_rename_one_way() {
+  local dir fake log out
+  dir=$TMP_ROOT/t3-identity
+  fake=$(make_t3_fakebin "$dir")
+  log="$dir/t3.log"
+  : > "$log"
+
+  out=$(FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" FM_T3_FAKE_TITLE=fm-thread-1 \
+    fm_backend_identity_status t3 thread-1 fm-thread-1)
+  [ "$out" = ok ] || fail "a title matching the expected fm-<id> should report ok (got '$out')"
+
+  out=$(FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" FM_T3_FAKE_TITLE='renamed by a human' \
+    fm_backend_identity_status t3 thread-1 fm-thread-1)
+  [ "$out" = "renamed:renamed by a human" ] \
+    || fail "a live title differing from the expected fm-<id> should report renamed:<live title> (got '$out')"
+
+  # Restoring the original title clears nothing on its own: the caller (the
+  # watcher) is the one that must not re-clear an already-recorded hold; this
+  # function itself just reports the current live truth each time it is asked.
+  out=$(FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" FM_T3_FAKE_TITLE=fm-thread-1 \
+    fm_backend_identity_status t3 thread-1 fm-thread-1)
+  [ "$out" = ok ] || fail "a restored title should read back as ok from this function alone (got '$out')"
+
+  out=$(FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" FM_T3_FAKE_MISSING=1 \
+    fm_backend_identity_status t3 thread-1 fm-thread-1)
+  [ "$out" = gone ] || fail "an unreadable thread should report gone, not renamed (got '$out')"
+
+  # A non-t3 backend has no identity concept: always ok, never touches the wire.
+  : > "$log"
+  out=$(fm_backend_identity_status tmux w1 fm-thread-1)
+  [ "$out" = ok ] || fail "a backend with no identity concept should always report ok (got '$out')"
+  assert_not_contains "$(cat "$log")" $'fm-t3' "a non-t3 identity check must never reach the t3 helper"
+
+  pass "fm_backend_identity_status: t3 reports ok/renamed:<title>/gone from the live title; other backends always report ok"
 }
 
 test_t3_send_key_and_send_literal_refusals() {
@@ -1486,6 +1562,8 @@ test_backend_validate_refuses_unknown
 test_backend_source_shell_portable
 test_backend_validate_spawn_accepts_orca
 test_backend_t3_required_tools_and_dispatch
+test_t3_target_exists_reads_worktree_drift_as_gone
+test_t3_identity_status_detects_rename_one_way
 test_t3_send_key_and_send_literal_refusals
 test_spawn_t3_refuses_unsupported_configurations
 test_t3_send_text_submit_prints_empty_or_send_failed

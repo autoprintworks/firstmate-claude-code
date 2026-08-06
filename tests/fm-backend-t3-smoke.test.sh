@@ -334,6 +334,176 @@ case "$SEND_CAP" in
 esac
 pass "a second turn via fm-send.sh proves steering after the first turn completes"
 
+# --- t3 captain-interaction verdicts (issue #56) ------------------------------
+#
+# Drives the same real fm-watch.sh this fleet runs, in short unattended rounds
+# against the spawn above (tight poll, no check/heartbeat cadence) - exactly
+# tests/fm-watch-triage.test.sh's round-based dead-agent pattern: each round
+# either exits on its own (an actionable wake) or stays alive (absorbed), and
+# either way is reaped before the next round starts.
+
+wait_live() {  # <pid> [ticks of 0.1s]
+  local pid=$1 limit=${2:-30} i=0
+  while [ "$i" -lt "$limit" ]; do
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 0
+}
+reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
+
+WATCH_OUT="$TMP_ROOT/t3-watch.out"
+: > "$WATCH_OUT"
+t3_watch_round() {  # [ticks to wait live, default 15 = ~1.5s]
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$SP_STATE" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$ROOT/bin/fm-watch.sh" >> "$WATCH_OUT" &
+  WATCH_PID=$!
+  if wait_live "$WATCH_PID" "${1:-15}"; then reap "$WATCH_PID"; else wait "$WATCH_PID" 2>/dev/null || true; fi
+}
+
+# The real turns above already left turn-end history in $SP_STATE with no
+# .seen-* marker yet, so the FIRST-ever fm-watch.sh run here would treat that
+# leftover history as a brand-new signal - noise unrelated to this test. One
+# throwaway round primes the .seen-* markers past it before any assertion below.
+t3_watch_round 30
+: > "$WATCH_OUT"
+
+# A standalone dispatcher, not bin/fm-t3: firstmate's own tooling must never
+# gain a "rename a thread" capability, since the captain-held inference below
+# depends on a rename being an external human signal. Posts thread.meta.update
+# exactly as a human's client would (the decider has no restrictive guard on
+# the caller), replicating bin/fm-t3's own origin/token discovery.
+DISPATCH="$TMP_ROOT/t3-dispatch.js"
+cat > "$DISPATCH" <<'NODE'
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+const { randomUUID } = require("node:crypto");
+
+const [, , threadId, field, value] = process.argv;
+if (!threadId || !field || value === undefined) {
+  process.stderr.write("usage: t3-dispatch.js <threadId> <title|worktreePath> <value>\n");
+  process.exit(2);
+}
+
+const FM_CONFIG = process.env.FM_CONFIG_OVERRIDE || path.join(process.env.FM_HOME || ".", "config");
+const T3_HOME = process.env.T3CODE_HOME || path.join(os.homedir(), ".t3");
+
+function readOrigin() {
+  const statePath = path.join(T3_HOME, "userdata", "server-runtime.json");
+  const origin = JSON.parse(fs.readFileSync(statePath, "utf8")).origin;
+  if (!origin) throw new Error(`${statePath} carries no origin`);
+  return String(origin).replace(/\/+$/, "");
+}
+
+function readToken() {
+  return fs.readFileSync(path.join(FM_CONFIG, "t3-token"), "utf8").trim();
+}
+
+async function main() {
+  const origin = readOrigin();
+  const token = readToken();
+  const command = { type: "thread.meta.update", commandId: randomUUID(), threadId, [field]: value };
+  const response = await fetch(`${origin}/api/orchestration/dispatch`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify(command),
+  });
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`thread.meta.update (${field}) returned ${response.status}: ${body.slice(0, 300)}`);
+  }
+}
+
+main().catch((error) => {
+  process.stderr.write(`${error.message}\n`);
+  process.exit(1);
+});
+NODE
+
+# --- a re-pointed worktree reads as gone, not idle ----------------------------
+
+SP_STATUS="$SP_STATE/$SP_ID.status"
+STATUS_LINES_BEFORE=$(wc -l < "$SP_STATUS" 2>/dev/null || echo 0)
+
+ELSEWHERE="$TMP_ROOT/repointed-elsewhere"
+mkdir -p "$ELSEWHERE" || fail "could not create the re-point scratch dir"
+FM_HOME="$ROOT" node "$DISPATCH" "$SP_THREAD" worktreePath "$(fm_backend_t3_native_path "$ELSEWHERE")" \
+  || fail "simulated worktree re-point (thread.meta.update) failed"
+
+t3_watch_round 15
+t3_watch_round 15
+STATUS_LINES_AFTER=$(wc -l < "$SP_STATUS" 2>/dev/null || echo 0)
+[ "$STATUS_LINES_AFTER" = "$STATUS_LINES_BEFORE" ] \
+  || fail "a re-pointed worktree changed the status file instead of reading as gone"$'\n'"$(cat "$SP_STATUS" 2>/dev/null)"
+[ ! -s "$WATCH_OUT" ] \
+  || fail "a re-pointed worktree produced a wake instead of reading as gone"$'\n'"$(cat "$WATCH_OUT")"
+pass "a re-pointed worktree reads as gone: no wake, no status change, no repair attempted"
+
+FM_HOME="$ROOT" node "$DISPATCH" "$SP_THREAD" worktreePath "$(fm_backend_t3_native_path "$SP_WT")" \
+  || fail "restoring the original worktree (thread.meta.update) failed"
+: > "$WATCH_OUT"
+
+# --- a rename away from fm-<id> infers captain-held, one-way -----------------
+
+RENAMED_TITLE="fm-$SP_ID renamed by the captain"
+FM_HOME="$ROOT" node "$DISPATCH" "$SP_THREAD" title "$RENAMED_TITLE" \
+  || fail "simulated rename (thread.meta.update) failed"
+
+CAUGHT=0
+for _ in $(seq 1 10); do
+  t3_watch_round 15
+  grep -q '^captain-held:' "$SP_STATUS" 2>/dev/null && { CAUGHT=1; break; }
+done
+[ "$CAUGHT" = 1 ] || fail "the renamed thread never landed in captain-held status"$'\n'"$(cat "$SP_STATUS" 2>/dev/null)"
+HELD_LINES=$(grep -c '^captain-held:' "$SP_STATUS")
+[ "$HELD_LINES" = 1 ] || fail "expected exactly one captain-held line, got $HELD_LINES"$'\n'"$(cat "$SP_STATUS")"
+grep -F "$RENAMED_TITLE" "$SP_STATUS" >/dev/null \
+  || fail "the captain-held line does not mention the renamed title"$'\n'"$(cat "$SP_STATUS")"
+pass "renaming the thread away from fm-$SP_ID is detected on the next poll and lands in captain-held status"
+
+STATUS_LINES_HELD=$(wc -l < "$SP_STATUS")
+: > "$WATCH_OUT"
+for _ in $(seq 1 5); do t3_watch_round 15; done
+[ "$(wc -l < "$SP_STATUS")" = "$STATUS_LINES_HELD" ] \
+  || fail "a captain-held window kept accumulating status lines instead of going quiet"$'\n'"$(cat "$SP_STATUS")"
+[ ! -s "$WATCH_OUT" ] || fail "a captain-held window still produced pokes"$'\n'"$(cat "$WATCH_OUT")"
+pass "pokes stop while the thread is captain-held"
+
+FM_HOME="$ROOT" node "$DISPATCH" "$SP_THREAD" title "fm-$SP_ID" \
+  || fail "restoring the original title (thread.meta.update) failed"
+: > "$WATCH_OUT"
+for _ in $(seq 1 5); do t3_watch_round 15; done
+[ "$(wc -l < "$SP_STATUS")" = "$STATUS_LINES_HELD" ] \
+  || fail "restoring the original title cleared or altered the captain-held status"$'\n'"$(cat "$SP_STATUS")"
+[ ! -s "$WATCH_OUT" ] || fail "restoring the original title produced a wake"$'\n'"$(cat "$WATCH_OUT")"
+pass "restoring the original title does not clear the captain-held inference (one-way)"
+
+# --- a directed send still arrives while captain-held -------------------------
+
+HELD_SEND_MARKER="firstmate-t3-held-send-smoke-$$"
+FM_HOME="$ROOT" FM_STATE_OVERRIDE="$SP_STATE" \
+  "$ROOT/bin/fm-send.sh" "$SP_ID" \
+  "Reply with exactly this one word and nothing else: $HELD_SEND_MARKER. Do not use any tools." \
+  >"$TMP_ROOT/held-send.out" 2>"$TMP_ROOT/held-send.err"
+status=$?
+[ "$status" -eq 0 ] || fail "fm-send.sh refused to steer a captain-held thread"$'\n'"$(cat "$TMP_ROOT/held-send.err")"
+
+for _ in $(seq 1 240); do
+  case "$(fm_backend_t3_busy_state "$SP_THREAD")" in
+    idle|exited) break ;;
+  esac
+  sleep 1
+done
+HELD_SEND_CAP=$(fm_backend_t3_capture "$SP_THREAD" 40) || fail "capture failed after the held-thread send"
+case "$HELD_SEND_CAP" in
+  *"$HELD_SEND_MARKER"*) ;;
+  *) fail "a directed send did not arrive while the thread was captain-held (marker $HELD_SEND_MARKER missing)" ;;
+esac
+pass "a directed send still arrives while the thread is captain-held"
+
 # --- a real teardown: stop, archive (never delete), sweep, then return lease -
 
 SP_PREFIX=$(fm_backend_t3_checkpoint_refs_prefix "$SP_THREAD" | tr -d '\r\n')

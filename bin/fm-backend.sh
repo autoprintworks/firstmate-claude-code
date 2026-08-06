@@ -1028,6 +1028,48 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
   esac
 }
 
+# fm_backend_target_exists_at: like fm_backend_target_exists, but for a backend
+# whose target can silently move underneath firstmate - today only t3, whose
+# UUID survives a worktree re-point that leaves the lease pointed at the wrong
+# tree entirely. A separate entry point rather than a new positional on
+# fm_backend_target_exists itself: that function's existing [expected-label]
+# slot already carries a TITLE for zellij/cmux at every call site, and an
+# expected WORKTREE PATH is a different kind of value, not an overload of the
+# same slot. Every other backend has no such concept and defers straight to
+# the cheap existence-only read.
+fm_backend_target_exists_at() {  # <backend> <target> <expected-worktree>
+  local backend=$1 target=$2 expected_worktree=$3
+  case "$backend" in
+    t3)
+      fm_backend_source t3 || return 1
+      fm_backend_t3_target_exists "$target" "$expected_worktree"
+      ;;
+    *)
+      fm_backend_target_exists "$backend" "$target"
+      ;;
+  esac
+}
+
+# fm_backend_identity_status: has a human touched this endpoint's identity out
+# from under firstmate, independent of whether it still exists? Only t3 has a
+# human-visible label distinct from firstmate's addressing target (a T3
+# thread's title, unlike a zellij tab name or pane title, is not itself the
+# selector - the UUID is - so a rename there is pure signal, never a firstmate
+# implementation detail leaking through). Every other backend has no such
+# concept and always reports `ok`.
+fm_backend_identity_status() {  # <backend> <target> <expected-label>
+  local backend=$1 target=$2 expected=$3
+  case "$backend" in
+    t3)
+      fm_backend_source t3 || { printf 'ok'; return 0; }
+      fm_backend_t3_identity_status "$target" "$expected"
+      ;;
+    *)
+      printf 'ok'
+      ;;
+  esac
+}
+
 # fm_backend_agent_state: the single recovery-grade agent/endpoint state
 # contract. It is deliberately richer than fm_backend_target_exists's cheap
 # pane-presence read and prints exactly one of:
