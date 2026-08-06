@@ -39,6 +39,8 @@
 //   fm-t3 kill <thread-id>
 //   fm-t3 purge [--thread <thread-id>] [--project-root <path>]
 //   fm-t3 checkpoint-refs <thread-id>
+//   fm-t3 info <thread-id>
+//   fm-t3 archived <thread-id>
 //   fm-t3 token-info
 
 const fs = require("node:fs");
@@ -617,6 +619,42 @@ function runCheckpointRefs() {
   process.stdout.write(`refs/t3/checkpoints/${Buffer.from(threadId, "utf8").toString("base64url")}\n`);
 }
 
+/**
+ * Title and worktree for a live thread, over the same cheap shell read every
+ * other poll uses. Exists so a caller can confirm WHAT was created (a spawn's
+ * title, its worktree) without reading the full transcript.
+ */
+async function runInfo() {
+  const [threadId] = positional;
+  if (!threadId) fail("info needs a thread id");
+  const origin = discoverOrigin();
+  const token = readToken();
+  const shell = await fetchShell(origin, token);
+  const entry = findThread(shell, threadId);
+  if (!entry) process.exit(3);
+  process.stdout.write([`title=${entry.title}`, `worktree=${entry.worktreePath ?? ""}`, ""].join("\n"));
+}
+
+/**
+ * Archived and deleted are indistinguishable over `/api/orchestration/shell`
+ * and `/api/orchestration/threads/:id` on purpose — every other command in
+ * this file treats both as `gone`, which is the correct read for a
+ * supervisor. Telling them apart needs the one surface that still carries
+ * the distinction: the archived-shell RPC, which only lists threads a human
+ * could still restore. A thread absent from IT (rather than merely absent
+ * from the live shell) really is deleted.
+ */
+async function runArchived() {
+  const [threadId] = positional;
+  if (!threadId) fail("archived needs a thread id");
+  const origin = discoverOrigin();
+  const token = readToken();
+  const snapshot = await wsRequest(origin, token, "orchestration.getArchivedShellSnapshot", {});
+  const entry = (snapshot.threads ?? []).find((candidate) => candidate.id === threadId);
+  if (!entry || !entry.archivedAt) process.exit(3);
+  process.stdout.write(`archived_at=${entry.archivedAt}\n`);
+}
+
 function runTokenInfo() {
   const token = readToken();
   const claims = decodeClaims(token);
@@ -658,11 +696,15 @@ async function main() {
       return runPurge();
     case "checkpoint-refs":
       return runCheckpointRefs();
+    case "info":
+      return runInfo();
+    case "archived":
+      return runArchived();
     case "token-info":
       return runTokenInfo();
     default:
       process.stderr.write(
-        "usage: fm-t3 <capture|busy|exists|worktree|send|spawn|kill|purge|checkpoint-refs|token-info> ...\n",
+        "usage: fm-t3 <capture|busy|exists|worktree|send|spawn|kill|purge|checkpoint-refs|info|archived|token-info> ...\n",
       );
       process.exit(2);
   }

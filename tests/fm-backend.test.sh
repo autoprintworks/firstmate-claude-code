@@ -141,7 +141,7 @@ resolve_permissive_tmux_kill_ref() {
 # hence the dispatcher is a copied sibling, while the tmux adapter is extracted
 # from BASE_REF so conformance tests retain the exact historical behavior even
 # when this branch changes tmux dispatch semantics.
-OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-tasks-axi-lib.sh fm-pr-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-supervision-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-decision-hold.sh fm-backend.sh fm-operational-input.sh fm-public-followup-lib.sh fm-x-lib.sh"
+OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-tasks-axi-lib.sh fm-pr-lib.sh fm-platform-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-supervision-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-decision-hold.sh fm-backend.sh fm-operational-input.sh fm-public-followup-lib.sh fm-x-lib.sh"
 # A pull-request merge may add a new main-only dependency that the branch's older baseline does not have yet.
 OLD_BIN_OPTIONAL_SIBLINGS="fm-pending-reply-lib.sh"
 OLD_BIN_REFACTORED="fm-send.sh fm-peek.sh fm-watch.sh fm-spawn.sh fm-teardown.sh fm-marker-lib.sh"
@@ -483,6 +483,7 @@ test_backend_validate_refuses_unknown() {
   fm_backend_validate tmux 2>/dev/null || fail "fm_backend_validate should accept tmux"
   fm_backend_validate orca 2>/dev/null || fail "fm_backend_validate should accept orca"
   fm_backend_validate codex-app 2>/dev/null || fail "fm_backend_validate should accept codex-app"
+  fm_backend_validate t3 2>/dev/null || fail "fm_backend_validate should accept t3"
   local out
   # bogus names a backend with no adapter at all. Every registered backend,
   # including host-assisted codex-app, is known and spawn-supported.
@@ -500,6 +501,8 @@ test_backend_source_shell_portable() {
   if command -v zsh >/dev/null 2>&1; then
     zsh -c "cd '$ROOT' && source bin/fm-backend.sh && fm_backend_source herdr && whence -w fm_backend_herdr_capture >/dev/null" 2>/dev/null \
       || fail "zsh: fm_backend_source herdr should load the adapter when sourced"
+    zsh -c "cd '$ROOT' && source bin/fm-backend.sh && fm_backend_source t3 && whence -w fm_backend_t3_capture >/dev/null" 2>/dev/null \
+      || fail "zsh: fm_backend_source t3 should load the adapter when sourced"
     out=$(zsh -c "cd '$ROOT' && source bin/fm-backend.sh && fm_backend_source bogus" 2>&1) \
       && fail "zsh: fm_backend_source bogus should fail"
     assert_contains "$out" "unknown backend 'bogus'" \
@@ -511,6 +514,8 @@ test_backend_source_shell_portable() {
 
   bash -c "cd '$ROOT' && source bin/fm-backend.sh && fm_backend_source herdr && declare -F fm_backend_herdr_capture >/dev/null" 2>/dev/null \
     || fail "bash: fm_backend_source herdr should load the adapter when sourced"
+  bash -c "cd '$ROOT' && source bin/fm-backend.sh && fm_backend_source t3 && declare -F fm_backend_t3_capture >/dev/null" 2>/dev/null \
+    || fail "bash: fm_backend_source t3 should load the adapter when sourced"
   out=$(bash -c "cd '$ROOT' && source bin/fm-backend.sh && fm_backend_source bogus" 2>&1) \
     && fail "bash: fm_backend_source bogus should fail"
   assert_contains "$out" "unknown backend 'bogus'" \
@@ -526,11 +531,346 @@ test_backend_validate_spawn_accepts_orca() {
   fm_backend_validate_spawn orca 2>/dev/null || fail "fm_backend_validate_spawn should accept orca"
   fm_backend_validate_spawn cmux 2>/dev/null || fail "fm_backend_validate_spawn should accept cmux"
   fm_backend_validate_spawn codex-app 2>/dev/null || fail "fm_backend_validate_spawn should accept codex-app"
+  fm_backend_validate_spawn t3 2>/dev/null || fail "fm_backend_validate_spawn should accept t3"
   out=$(fm_backend_validate_spawn bogus 2>&1) && fail "fm_backend_validate_spawn should still refuse unknown backends"
   assert_contains "$out" "unknown backend 'bogus'" "fm_backend_validate_spawn did not preserve unknown-backend validation"
   out=$(fm_backend_validate_spawn "tmux herdr" 2>&1) && fail "fm_backend_validate_spawn should refuse a multi-token backend name"
   assert_contains "$out" "unknown backend 'tmux herdr'" "fm_backend_validate_spawn accepted a multi-token backend name"
   pass "fm_backend_validate_spawn: all implemented lifecycle backends are spawn-supported"
+}
+
+# --- t3 fakebin ---------------------------------------------------------------
+#
+# The t3 adapter's only external dependency is bin/fm-t3, a Node helper reached
+# through FM_T3_NODE/FM_T3_HELPER (both plain env-var overrides). Pointing
+# FM_T3_NODE at plain bash and FM_T3_HELPER at this fake script substitutes the
+# whole Node helper without touching a real T3 server or introducing a stub
+# HTTP seam: firstmate's own scripts run for real, only the wire boundary is
+# faked. Every invocation is logged in the make_send_fakebin \x1f-delimited
+# convention so call order and arguments can be asserted exactly.
+
+make_t3_fakebin() {  # <dir> -> echoes the fake helper script path; logs every call to $FM_T3_LOG
+  local dir=$1 helper="$1/fake-fm-t3"
+  mkdir -p "$dir"
+  cat > "$helper" <<'SH'
+#!/usr/bin/env bash
+set -u
+mode=${1:-}
+{ printf 'fm-t3'; for a in "$@"; do printf '\x1f%s' "$a"; done; printf '\n'; } >> "${FM_T3_LOG:?}"
+case "$mode" in
+  capture) printf '%s\n' "${FM_T3_FAKE_CAPTURE:-FAKE-CAPTURE}" ;;
+  worktree) printf '%s\n' "${FM_T3_FAKE_WORKTREE:-/fake/worktree}" ;;
+  busy) printf '%s\n' "${FM_T3_FAKE_BUSY:-idle}" ;;
+  send) [ -z "${FM_T3_FAKE_SEND_FAIL:-}" ] || exit 1; exit 0 ;;
+  spawn)
+    # Optional live check for spawn-ordering tests: at the moment the thread
+    # would be created, does the caller's task record already exist and
+    # already carry t3_thread=? Unset FM_T3_META_PATH skips this entirely, so
+    # it never changes behavior for callers that only care about spawn/fail.
+    if [ -n "${FM_T3_META_PATH:-}" ]; then
+      if [ -f "$FM_T3_META_PATH" ] && grep -q '^t3_thread=.' "$FM_T3_META_PATH" 2>/dev/null; then
+        printf 'META-CHECK\x1fpresent-with-thread\n' >> "${FM_T3_LOG:?}"
+      else
+        printf 'META-CHECK\x1fmissing-or-incomplete\n' >> "${FM_T3_LOG:?}"
+      fi
+    fi
+    [ -z "${FM_T3_FAKE_SPAWN_FAIL:-}" ] || exit 1
+    exit 0
+    ;;
+  kill) [ -z "${FM_T3_FAKE_KILL_FAIL:-}" ] || exit 1; exit 0 ;;
+  checkpoint-refs) printf 'refs/t3/checkpoints/%s/\n' "${2:-unknown}" ;;
+  exists) [ -z "${FM_T3_FAKE_MISSING:-}" ] || exit 1; exit 0 ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$helper"
+  printf '%s\n' "$helper"
+}
+
+test_backend_t3_required_tools_and_dispatch() {
+  local out
+  [ "$(fm_backend_required_tools t3)" = "node treehouse" ] \
+    || fail "fm_backend_required_tools t3 should print 'node treehouse'"
+
+  local dir=$TMP_ROOT/t3-dispatch fake log
+  fake=$(make_t3_fakebin "$dir")
+  log="$dir/t3.log"
+  : > "$log"
+
+  out=$(FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" fm_backend_capture t3 thread-1 5)
+  [ "$out" = FAKE-CAPTURE ] || fail "fm_backend_capture t3 did not route to fm_backend_t3_capture"
+
+  out=$(FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" fm_backend_busy_state t3 thread-1)
+  [ "$out" = idle ] || fail "fm_backend_busy_state t3 did not route to fm_backend_t3_busy_state"
+
+  FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" fm_backend_send_key t3 thread-1 Enter \
+    || fail "fm_backend_send_key t3 Enter did not route to fm_backend_t3_send_key"
+
+  out=$(FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" fm_backend_send_text_submit t3 thread-1 hi 1 0 0)
+  [ "$out" = empty ] || fail "fm_backend_send_text_submit t3 did not route to fm_backend_t3_send_text_submit"
+
+  FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" fm_backend_kill t3 thread-1 \
+    || fail "fm_backend_kill t3 did not route to fm_backend_t3_kill"
+
+  FM_T3_NODE=bash FM_T3_HELPER="$fake" FM_T3_LOG="$log" fm_backend_target_exists t3 thread-1 \
+    || fail "fm_backend_target_exists t3 did not route to fm_backend_t3_target_exists"
+
+  assert_contains "$(cat "$log")" $'fm-t3\x1fcapture\x1fthread-1\x1f5' "capture call was not logged with the expected args"
+  assert_contains "$(cat "$log")" $'fm-t3\x1fbusy\x1fthread-1' "busy call was not logged with the expected args"
+  assert_contains "$(cat "$log")" $'fm-t3\x1fsend\x1fthread-1\x1fhi' "send call was not logged with the expected args"
+  assert_contains "$(cat "$log")" $'fm-t3\x1fkill\x1fthread-1' "kill call was not logged with the expected args"
+  assert_contains "$(cat "$log")" $'fm-t3\x1fexists\x1fthread-1' "exists call was not logged with the expected args"
+  # send_key Enter is a documented no-op success that never reaches the wire.
+  assert_not_contains "$(cat "$log")" $'fm-t3\x1fkey' "send_key Enter should not call the t3 helper at all"
+
+  pass "t3: required tools are node+treehouse and every generic dispatcher resolves to the t3 adapter"
+}
+
+test_t3_send_key_and_send_literal_refusals() {
+  local dir helper log
+  dir=$TMP_ROOT/t3-key-refusals
+  helper=$(make_t3_fakebin "$dir")
+  log="$dir/t3.log"
+  : > "$log"
+
+  fm_backend_source t3 || fail "fm_backend_source t3 should load the adapter"
+
+  FM_T3_NODE=bash FM_T3_HELPER="$helper" FM_T3_LOG="$log" fm_backend_send_key t3 thread-1 Escape 2>/dev/null \
+    && fail "fm_backend_send_key t3 Escape should be refused; t3 has no key channel"
+
+  FM_T3_NODE=bash FM_T3_HELPER="$helper" FM_T3_LOG="$log" fm_backend_t3_send_literal thread-1 'literal text' 2>/dev/null \
+    && fail "fm_backend_t3_send_literal should be refused; t3 has no composer"
+
+  assert_not_contains "$(cat "$log")" $'fm-t3' \
+    "an unsupported key and a literal send with no submit must both refuse before touching the wire"
+
+  pass "t3: an unsupported key and a literal send with no submit are both refused loudly, before reaching the wire"
+}
+
+test_spawn_t3_refuses_unsupported_configurations() {
+  local state config data out status
+  state="$TMP_ROOT/t3refuse-state"; config="$TMP_ROOT/t3refuse-config"; data="$TMP_ROOT/t3refuse-data"
+  mkdir -p "$state" "$config"
+
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" \
+    FM_CONFIG_OVERRIDE="$config" FM_PROJECTS_OVERRIDE="$TMP_ROOT/t3refuse-unused-projects" \
+    FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" t3refuseharn1 projects/none grok --backend t3 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "fm-spawn --backend t3 with a non-claude harness should refuse"
+  assert_contains "$out" "backend=t3 supports only the claude harness" \
+    "fm-spawn did not name the refused t3 harness"
+
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" \
+    FM_CONFIG_OVERRIDE="$config" FM_PROJECTS_OVERRIDE="$TMP_ROOT/t3refuse-unused-projects" \
+    FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" t3refuseraw1 projects/none 'claude --dangerous flag' --backend t3 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "fm-spawn --backend t3 with a raw launch command should refuse"
+  assert_contains "$out" "backend=t3 does not support raw launch commands" \
+    "fm-spawn did not name the refused t3 raw launch command"
+
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" \
+    FM_CONFIG_OVERRIDE="$config" FM_PROJECTS_OVERRIDE="$TMP_ROOT/t3refuse-unused-projects" \
+    FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" t3refusesm1 projects/none claude --backend t3 --secondmate 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "fm-spawn --backend t3 --secondmate should refuse"
+  assert_contains "$out" "backend=t3 does not support --secondmate" \
+    "fm-spawn did not name the refused t3 secondmate mode"
+
+  pass "fm-spawn.sh --backend t3: an unsupported harness, a raw launch command, and --secondmate are all refused loudly"
+}
+
+test_t3_send_text_submit_prints_empty_or_send_failed() {
+  local dir helper log out
+  dir=$TMP_ROOT/t3-submit
+  helper=$(make_t3_fakebin "$dir")
+  log="$dir/t3.log"
+  : > "$log"
+
+  out=$(FM_T3_NODE=bash FM_T3_HELPER="$helper" FM_T3_LOG="$log" \
+    fm_backend_send_text_submit t3 thread-1 'hello there' 1 0 0)
+  [ "$out" = empty ] || fail "a delivered turn should print the literal word empty (got '$out')"
+
+  out=$(FM_T3_NODE=bash FM_T3_HELPER="$helper" FM_T3_LOG="$log" FM_T3_FAKE_SEND_FAIL=1 \
+    fm_backend_send_text_submit t3 thread-1 'hello there' 1 0 0)
+  [ "$out" = send-failed ] || fail "a rejected turn should print the literal word send-failed (got '$out')"
+
+  pass "t3: send_text_submit prints the literal word empty on delivery and send-failed on rejection, never blank"
+}
+
+test_backend_validate_task_endpoint_t3() {
+  local meta task_id thread
+  task_id=t3endpoint1
+  thread=00000000-0000-4000-8000-0000000000e1
+  meta="$TMP_ROOT/$task_id.meta"
+
+  fm_write_meta "$meta" \
+    "window=$thread" "endpoint_task_id=$task_id" "worktree=/tmp/wt" "project=/tmp/proj" \
+    "backend=t3" "t3_thread=$thread"
+  fm_backend_validate_task_endpoint "$meta" "$task_id" >/dev/null \
+    || fail "validate_task_endpoint should accept well-formed t3 metadata"
+  [ "$FM_BACKEND_VALIDATED_BACKEND" = t3 ] || fail "validator should report backend t3"
+  [ "$FM_BACKEND_VALIDATED_TARGET" = "$thread" ] || fail "validator should report the thread as the target"
+
+  fm_write_meta "$meta.mismatch" \
+    "window=$thread" "endpoint_task_id=$task_id" "worktree=/tmp/wt" "project=/tmp/proj" \
+    "backend=t3" "t3_thread=00000000-0000-4000-8000-0000000000e2"
+  fm_backend_validate_task_endpoint "$meta.mismatch" "$task_id" >/dev/null 2>&1 \
+    && fail "validator should refuse a t3_thread that disagrees with window"
+
+  fm_write_meta "$meta.notuuid" \
+    "window=fm-not-a-uuid" "endpoint_task_id=$task_id" "worktree=/tmp/wt" "project=/tmp/proj" \
+    "backend=t3" "t3_thread=fm-not-a-uuid"
+  fm_backend_validate_task_endpoint "$meta.notuuid" "$task_id" >/dev/null 2>&1 \
+    && fail "validator should refuse a non-UUID t3 endpoint"
+
+  pass "fm_backend_validate_task_endpoint: accepts well-formed t3 metadata, refuses a thread/window mismatch and a non-UUID endpoint"
+}
+
+make_t3_spawn_fakebin() {  # <dir> <fake-worktree-path> -> echoes fakebin dir; logs treehouse calls to $FM_T3_LOG
+  local dir=$1 wt=$2 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/treehouse" <<SH
+#!/usr/bin/env bash
+set -u
+{ printf 'treehouse'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_T3_LOG:?}"
+case "\${1:-}" in
+  get) printf '%s\n' "$wt" ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/treehouse"
+  printf '%s\n' "$fb"
+}
+
+test_spawn_t3_leases_worktree_and_writes_record_before_thread_create() {
+  local proj wt data id state config helper fb log out status meta pybin cand
+  proj="$TMP_ROOT/t3spawn-project"; wt="$TMP_ROOT/t3spawn-wt"
+  id="t3spawnorder1"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  data="$TMP_ROOT/t3spawn-data"; mkdir -p "$data/$id"
+  printf 'brief for t3 spawn ordering\n' > "$data/$id/brief.md"
+  state="$TMP_ROOT/t3spawn-state"; config="$TMP_ROOT/t3spawn-config"
+  mkdir -p "$state" "$config"
+  meta="$state/$id.meta"
+
+  helper=$(make_t3_fakebin "$TMP_ROOT/t3spawn-helper")
+  fb=$(make_t3_spawn_fakebin "$TMP_ROOT/t3spawn-fake" "$wt")
+  log="$TMP_ROOT/t3spawn.log"
+  : > "$log"
+
+  pybin=
+  for cand in python3 python py; do
+    if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import sys, json' >/dev/null 2>&1; then
+      pybin=$cand
+      break
+    fi
+  done
+  [ -n "$pybin" ] || fail "no working python found on PATH; needed to mint the t3 thread id"
+
+  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/t3spawn-unused-projects" FM_SPAWN_NO_GUARD=1 \
+    FM_COMPOSER_PYTHON="$pybin" \
+    FM_T3_NODE=bash FM_T3_HELPER="$helper" FM_T3_LOG="$log" FM_T3_META_PATH="$meta" \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend t3 2>&1)
+  status=$?
+  expect_code 0 "$status" "fm-spawn.sh --backend t3 should succeed"$'\n'"$out"
+
+  assert_contains "$(cat "$log")" $'treehouse\x1fget' "spawn did not lease the worktree via treehouse get"
+  assert_contains "$(cat "$log")" $'fm-t3\x1fspawn' "spawn did not create the t3 thread through the helper"
+  assert_contains "$(cat "$log")" $'META-CHECK\x1fpresent-with-thread' \
+    "the task record must already contain t3_thread= at the moment the thread is created"
+
+  local get_line create_line
+  get_line=$(grep -Fn $'treehouse\x1fget' "$log" | head -1 | cut -d: -f1)
+  create_line=$(grep -Fn $'fm-t3\x1fspawn' "$log" | head -1 | cut -d: -f1)
+  [ -n "$get_line" ] && [ -n "$create_line" ] && [ "$get_line" -lt "$create_line" ] \
+    || fail "treehouse get should precede the t3 thread create call (get=$get_line create=$create_line)"
+
+  pass "fm-spawn.sh --backend t3: the worktree is leased and the task record is written before the thread is created"
+}
+
+test_teardown_t3_kill_precedes_worktree_return() {
+  local proj wt id state data config helper fb log meta out status thread
+  proj="$TMP_ROOT/t3teardown-project"; wt="$TMP_ROOT/t3teardown-wt"
+  id="t3teardownorder1"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+
+  data="$TMP_ROOT/t3teardown-data"; mkdir -p "$data/$id"
+  printf 'scout findings\n' > "$data/$id/report.md"
+
+  state="$TMP_ROOT/t3teardown-state"; config="$TMP_ROOT/t3teardown-config"
+  mkdir -p "$state" "$config"
+  meta="$state/$id.meta"
+
+  thread=00000000-0000-4000-8000-0000000000f6
+  fm_write_meta "$meta" \
+    "window=$thread" "endpoint_task_id=$id" "worktree=$wt" "project=$proj" "backend=t3" \
+    "t3_thread=$thread" "t3_checkpoint_refs=1" "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off" \
+    "decisions_reviewed=1" "decision_keys="
+
+  helper=$(make_t3_fakebin "$TMP_ROOT/t3teardown-helper")
+  fb=$(make_t3_spawn_fakebin "$TMP_ROOT/t3teardown-fake" "$wt")
+  log="$TMP_ROOT/t3teardown.log"
+  : > "$log"
+
+  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_T3_NODE=bash FM_T3_HELPER="$helper" FM_T3_LOG="$log" \
+    "$ROOT/bin/fm-teardown.sh" "$id" 2>&1)
+  status=$?
+  expect_code 0 "$status" "fm-teardown.sh should tear down a scout t3 task"$'\n'"$out"
+
+  assert_contains "$(cat "$log")" $'fm-t3\x1fkill' "teardown did not stop the t3 thread"
+  assert_contains "$(cat "$log")" $'treehouse\x1freturn' "teardown did not return the leased worktree"
+
+  local kill_line return_line
+  kill_line=$(grep -Fn $'fm-t3\x1fkill' "$log" | head -1 | cut -d: -f1)
+  return_line=$(grep -Fn $'treehouse\x1freturn' "$log" | head -1 | cut -d: -f1)
+  [ -n "$kill_line" ] && [ -n "$return_line" ] && [ "$kill_line" -lt "$return_line" ] \
+    || fail "t3 teardown should stop the thread before returning its leased worktree (kill=$kill_line return=$return_line)"
+
+  pass "fm-teardown.sh: a t3 task is stopped before its leased worktree is returned"
+}
+
+test_t3_checkpoint_sweep_scoped_to_project_and_idempotent() {
+  local proj thread head prefix helper log out rc1 rc2 remaining
+  proj="$TMP_ROOT/t3sweep-project"
+  mkdir -p "$proj"
+  git -C "$proj" init -q -b main >/dev/null 2>&1 || fail "could not init the sweep project"
+  git -C "$proj" -c user.email=sweep@test -c user.name=sweep commit -q --allow-empty -m init >/dev/null 2>&1 \
+    || fail "could not create the sweep project's initial commit"
+  head=$(git -C "$proj" rev-parse HEAD)
+
+  thread=00000000-0000-4000-8000-0000000000f7
+  prefix="refs/t3/checkpoints/$thread"
+  git -C "$proj" update-ref "$prefix/turn/1" "$head" || fail "could not plant checkpoint ref 1"
+  git -C "$proj" update-ref "$prefix/turn/2" "$head" || fail "could not plant checkpoint ref 2"
+
+  helper=$(make_t3_fakebin "$TMP_ROOT/t3sweep-helper")
+  log="$TMP_ROOT/t3sweep.log"
+  : > "$log"
+
+  fm_backend_source t3 || fail "fm_backend_source t3 should load the adapter"
+
+  # Run from an unrelated cwd: the sweep must target <project-abs>, not
+  # whatever directory happened to invoke it.
+  out=$(cd "$TMP_ROOT" && FM_T3_NODE=bash FM_T3_HELPER="$helper" FM_T3_LOG="$log" \
+    fm_backend_t3_sweep_checkpoint_refs "$thread" "$proj" 2>&1)
+  rc1=$?
+  [ "$rc1" = 0 ] || fail "first checkpoint sweep should succeed (got rc=$rc1)"$'\n'"$out"
+  remaining=$(git -C "$proj" for-each-ref --format='%(refname)' "$prefix" | grep -c . || true)
+  [ "$remaining" = 0 ] || fail "first sweep should remove every checkpoint ref under $prefix (left $remaining)"
+
+  out=$(cd "$TMP_ROOT" && FM_T3_NODE=bash FM_T3_HELPER="$helper" FM_T3_LOG="$log" \
+    fm_backend_t3_sweep_checkpoint_refs "$thread" "$proj" 2>&1)
+  rc2=$?
+  [ "$rc2" = 0 ] || fail "a second sweep with nothing left to sweep should still succeed (got rc=$rc2)"$'\n'"$out"
+
+  pass "fm_backend_t3_sweep_checkpoint_refs: scoped to the given project regardless of caller cwd, and safe to run twice"
 }
 
 test_meta_get_and_backend_of_meta() {
@@ -1145,6 +1485,14 @@ test_backend_name_explicit_beats_detection
 test_backend_validate_refuses_unknown
 test_backend_source_shell_portable
 test_backend_validate_spawn_accepts_orca
+test_backend_t3_required_tools_and_dispatch
+test_t3_send_key_and_send_literal_refusals
+test_spawn_t3_refuses_unsupported_configurations
+test_t3_send_text_submit_prints_empty_or_send_failed
+test_backend_validate_task_endpoint_t3
+test_spawn_t3_leases_worktree_and_writes_record_before_thread_create
+test_teardown_t3_kill_precedes_worktree_return
+test_t3_checkpoint_sweep_scoped_to_project_and_idempotent
 test_meta_get_and_backend_of_meta
 test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
